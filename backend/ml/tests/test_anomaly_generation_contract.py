@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -84,6 +84,7 @@ def detector(tmp_path, monkeypatch, store):
     service._generation_lock = threading.RLock()
     service._training_lock = threading.RLock()
     service._generations = {"driver_behavior": 4}
+    service._max_feature_buffers = 4096
     model = LSTMAutoencoder(2, 3, 2)
     model.build_model()
     scaler = StandardScaler().fit(observations().reshape(-1, 2))
@@ -100,9 +101,9 @@ def detector(tmp_path, monkeypatch, store):
     model.threshold = float(np.percentile(errors, 95))
     service.models = {"driver_behavior": model}
     service.scalers = {"driver_behavior": scaler}
-    service._feature_buffers = {
-        ("driver_behavior", "driver"): deque([scaled[0, 0].copy()], maxlen=3)
-    }
+    service._feature_buffers = OrderedDict(
+        {("driver_behavior", "driver"): deque([scaled[0, 0].copy()], maxlen=3)}
+    )
     service.anomaly_history = deque(maxlen=1000)
     service.alert_thresholds = {"low": 1.5, "medium": 2.0, "high": 3.0}
     return service
