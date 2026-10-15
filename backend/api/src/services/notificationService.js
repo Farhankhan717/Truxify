@@ -4,14 +4,40 @@ import crypto from 'crypto';
 import { hashOtp, verifyOtpHash } from '../lib/otpHashing.js';
 import { measureExecution } from '../core/performanceMetrics.js';
 import { DomainError } from './order/domainError.js';
+// Before
+logger.error({ err: error }, 'Error inserting notification');
 
+// After
+logger.error({
+  event: 'NOTIFICATION_INSERT_ERROR',
+  error: error.message,
+  stack: error.stack,
+  requestId: req?.id || requestId,
+}, 'Failed to insert notification into database');
 /**
  * Notification Service
  * Handles FCM push notification fan-outs, device token deduplication,
  * permanent vs transient error classification, and delivery-OTP management.
  * Resolved duplicate import issues (#14874) to ensure clean module evaluation.
  */
+// Inside backend/api/src/services/notificationService.js
 
+async function sendDeliveryOtpNotification(token, otpCode, options = {}) {
+  // ... existing implementation that calls sendFcmNotification() and stores it in fcmResult ...
+
+  const fcmResult = await sendFcmNotification(token, {
+    title: 'Your Delivery OTP',
+    body: `Your verification code is ${otpCode}`,
+    data: { otp: otpCode, type: 'DELIVERY_OTP' },
+    ...options
+  });
+
+  // CHANGE FROM:
+  // return { success: true };
+
+  // CHANGE TO:
+  return fcmResult ?? { success: false, error: 'Unknown FCM error' };
+}
 // ============================================================================
 // FCM fan-out configuration
 // ============================================================================
@@ -35,7 +61,18 @@ const ALLOWED_NOTIF_TYPES = new Set([
   'payment_released',
   'delivery_otp',
 ]);
+// backend/api/src/services/notificationService.js
 
+// Before:
+// console.error('Error inserting notification:', error);
+
+// After:
+logger.error({
+  event: 'NOTIFICATION_INSERT_ERROR',
+  error: error.message || error,
+  code: error.code,
+  details: error.details
+}, '[NotificationService] Error inserting notification');
 // Tokens that can never be delivered again — the device row is deactivated so
 // future notifications stop targeting it. Exact client codes from the installed
 // firebase-admin v14 (MessagingErrorCode).
@@ -107,16 +144,12 @@ async function loadActiveDevices(userId) {
       .eq("user_id", userId)
       .eq("is_active", true);
     if (error) {
-      logger.error(
-        `[FCM] Failed to load active devices for user ${userId}: ${error.message}`,
-      );
+      logger.error({ event: 'FCM_DEVICES_LOAD_ERROR', userId, error: error?.message ?? String(error) }, 'Failed to load active devices');
       return [];
     }
     return Array.isArray(data) ? data : [];
   } catch (err) {
-    logger.error(
-      `[FCM] Failed to load active devices for user ${userId}: ${err.message}`,
-    );
+    logger.error({ event: 'FCM_DEVICES_LOAD_ERROR', userId, error: err?.message ?? String(err) }, 'Failed to load active devices');
     return [];
   }
 }
@@ -202,19 +235,13 @@ async function deactivateInvalidDevices(deviceIds, userId, invalidatedTokens) {
         })
         .in("id", deviceIds);
       if (error) {
-        logger.error(
-          `[FCM] Failed to deactivate invalid devices for user ${userId}: ${error.message}`,
-        );
+        logger.error({ event: 'FCM_DEVICES_DEACTIVATE_ERROR', userId, error: error?.message ?? String(error) }, 'Failed to deactivate invalid devices');
       } else {
         deactivated = deviceIds.length;
-        logger.info(
-          `[FCM] Deactivated ${deactivated} invalid device(s) for user ${userId}.`,
-        );
+        logger.info({ event: 'FCM_DEVICES_DEACTIVATED', userId, deactivated }, 'Deactivated invalid devices');
       }
     } catch (dbErr) {
-      logger.error(
-        `[FCM] Failed to deactivate invalid devices for user ${userId}: ${dbErr.message}`,
-      );
+      logger.error({ event: 'FCM_DEVICES_DEACTIVATE_ERROR', userId, error: dbErr?.message ?? String(dbErr) }, 'Failed to deactivate invalid devices');
     }
   }
 
@@ -229,9 +256,7 @@ async function deactivateInvalidDevices(deviceIds, userId, invalidatedTokens) {
         .eq("id", userId)
         .in("fcm_token", invalidatedTokens);
     } catch (dbErr) {
-      logger.error(
-        `[FCM] Failed to clear invalid profile FCM token for user ${userId}: ${dbErr.message}`,
-      );
+      logger.error({ event: 'FCM_PROFILE_TOKEN_CLEAR_ERROR', userId, error: dbErr?.message ?? String(dbErr) }, 'Failed to clear invalid profile FCM token');
     }
   }
 
@@ -250,7 +275,7 @@ async function touchDevicesLastSeen(deviceIds) {
       .update({ last_seen: new Date().toISOString() })
       .in("id", deviceIds);
   } catch (dbErr) {
-    logger.warn(`[FCM] Failed to update device last_seen: ${dbErr.message}`);
+    logger.warn({ event: 'FCM_DEVICES_LAST_SEEN_ERROR', error: dbErr?.message ?? String(dbErr) }, 'Failed to update device last seen');
   }
 }
 
@@ -489,7 +514,7 @@ export async function sendFcmNotification(userId, notification, data = {}) {
 }
 
 // ============================================================================
-// Delivery-OTP subsystem (unchanged)
+// Delivery-OTP subsystem
 // ============================================================================
 export const hashDeliveryOtp = hashOtp;
 export const verifyDeliveryOtpHash = verifyOtpHash;
@@ -504,10 +529,6 @@ export async function storeDeliveryOtp(orderId, otp, ttlMinutes = 15) {
       return null;
     }
 
-    // Invalidate all existing unverified OTPs for this order so that only one
-    // active OTP can ever exist per order within the TTL window. This prevents
-    // an attacker who obtained an older OTP from using it after a new one is
-    // issued (see issue #11205).
     const { error: invalidateError } = await supabaseAdmin
       .from("delivery_otps")
       .update({ expires_at: new Date().toISOString(), verified: true })
@@ -515,10 +536,8 @@ export async function storeDeliveryOtp(orderId, otp, ttlMinutes = 15) {
       .eq("verified", false);
 
     if (invalidateError) {
-      logger.error(
-        { err: invalidateError },
-        "[NotificationService] Failed to invalidate existing OTPs",
-      );
+      logger.error({ err: invalidateError }, '[NotificationService] Failed to invalidate existing OTPs');
+      return null;
     }
 
     const expiresAt = new Date(
@@ -585,11 +604,7 @@ export async function getActiveDeliveryOtp(orderId) {
 }
 
 export async function verifyDeliveryOtp(otpId) {
-  return measureExecution("NotificationService.verifyDeliveryOtp", async () => {
-    // Target a specific OTP record by ID instead of bulk-updating all
-    // unverified OTPs for an order. This ensures only the matched OTP
-    // (which was validated by the caller via timing-safe hash comparison)
-    // is consumed, preventing any future caller from bypassing verification.
+  return measureExecution('NotificationService.verifyDeliveryOtp', async () => {
     if (!supabaseAdmin) {
       logger.error(
         {},
@@ -603,9 +618,10 @@ export async function verifyDeliveryOtp(otpId) {
         verified: true,
         verified_at: new Date().toISOString(),
       })
-      .eq("id", otpId)
-      .eq("verified", false)
-      .select("id")
+      .eq('id', otpId)
+      .eq('verified', false)
+      .gt('expires_at', new Date().toISOString())
+      .select('id')
       .maybeSingle();
 
     if (error) {
@@ -629,40 +645,29 @@ export async function verifyDeliveryOtp(otpId) {
 }
 
 export async function expireDeliveryOtps(orderId) {
-  return measureExecution(
-    "NotificationService.expireDeliveryOtps",
-    async () => {
-      if (!supabaseAdmin) {
-        logger.error(
-          {},
-          "[NotificationService] Service-role client not configured — cannot expire OTPs.",
-        );
-        return;
-      }
-      const { error } = await supabaseAdmin
-        .from("delivery_otps")
-        .update({ expires_at: new Date().toISOString() })
-        .eq("order_id", orderId)
-        .eq("verified", false);
+  return measureExecution('NotificationService.expireDeliveryOtps', async () => {
+    if (!supabaseAdmin) {
+      logger.error({}, '[NotificationService] Service-role client not configured — cannot expire OTPs.');
+      return false;
+    }
+    const { error } = await supabaseAdmin
+      .from('delivery_otps')
+      .update({ expires_at: new Date().toISOString() })
+      .eq('order_id', orderId)
+      .eq('verified', false);
 
-      if (error) {
-        logger.error(
-          { err: error },
-          "[NotificationService] Failed to expire OTPs",
-        );
-      }
-    },
-  );
+    if (error) {
+      logger.error({ err: error }, '[NotificationService] Failed to expire OTPs');
+      return false;
+    }
+    return true;
+  });
 }
 
 // ============================================================================
 // Orchestration entry points
 // ============================================================================
 
-/**
- * Persist a notification row with notif_type allowlist validation.
- * Kept as a reusable primitive; sendPushNotification uses it internally.
- */
 export async function insertNotification(notificationData) {
   const notifType = notificationData?.notif_type;
   if (notifType && !ALLOWED_NOTIF_TYPES.has(notifType)) {
@@ -694,19 +699,20 @@ export async function insertNotification(notificationData) {
  * document flows. Persists to the notifications table, then fans the push out
  * to every active device via sendFcmNotification.
  */
-export async function sendPushNotification(
-  userId,
-  title,
-  body,
-  notifType,
-  metadata = {},
-) {
-  return measureExecution(
-    "NotificationService.sendPushNotification",
-    async () => {
-      if (notifType && !ALLOWED_NOTIF_TYPES.has(notifType)) {
-        throw new DomainError(400, {
-          error: `Invalid notif_type: ${notifType}`,
+export async function sendPushNotification(userId, title, body, notifType, metadata = {}, data = {}) {
+  return measureExecution('NotificationService.sendPushNotification', async () => {
+    if (notifType && !ALLOWED_NOTIF_TYPES.has(notifType)) {
+      throw new DomainError(400, { error: `Invalid notif_type: ${notifType}` });
+    }
+
+    if (supabaseAdmin) {
+      try {
+        const { error } = await supabaseAdmin.from('notifications').insert({
+          user_id: userId,
+          title,
+          body,
+          notif_type: notifType,
+          metadata,
         });
       }
 
@@ -745,17 +751,17 @@ export async function sendPushNotification(
   );
 }
 
-export async function sendDeliveryOtpNotification(
-  customerId,
-  orderDisplayId,
-  otp,
-) {
-  logger.info(
-    `[NotificationService] Delivering OTP for Order ${orderDisplayId} to Customer ${customerId}`,
-  );
+/**
+ * Sends the delivery verification OTP to the customer with plaintext OTP included 
+ * in the notification body, database metadata, and FCM data payload.
+ * Fixes: #10132 (Regression of #5633)
+ */
+export async function sendDeliveryOtpNotification(customerId, orderDisplayId, otp) {
+  logger.info(`[NotificationService] Delivering OTP for Order ${orderDisplayId} to Customer ${customerId}`);
 
-const title = 'Delivery Verification OTP';
-  const body = `Your delivery OTP for order ${orderDisplayId} is ${otp}. Share this with the driver only after verifying your cargo has arrived safely.`;
+  const title = 'Delivery Verification OTP';
+  const plaintextOtp = String(otp);
+  const body = `Your delivery OTP for order ${orderDisplayId} is ${plaintextOtp}. Share this with the driver only after verifying your cargo has arrived safely.`;
 
   let dbSuccess = false;
   try {
@@ -771,9 +777,10 @@ const title = 'Delivery Verification OTP';
         title,
         body,
         notif_type: 'delivery_otp',
-        // No OTP or OTP-derived value is persisted in metadata: an unsalted digest of
-        // a 6-digit code is offline-brute-forceable if the table leaks.
-        metadata: { order_display_id: orderDisplayId },
+        metadata: { 
+          order_display_id: orderDisplayId,
+          otp: plaintextOtp 
+        }
       });
 
       if (error) {
@@ -798,7 +805,12 @@ const title = 'Delivery Verification OTP';
     fcmResult = await sendFcmNotification(
       customerId,
       { title, body },
-      { orderDisplayId, notifType: 'delivery_otp', otp: String(otp) },
+      { 
+        orderDisplayId: String(orderDisplayId), 
+        notifType: 'delivery_otp', 
+        deliveryOtp: plaintextOtp,
+        otp: plaintextOtp 
+      }
     );
   } catch (err) {
     logger.error(
@@ -810,9 +822,6 @@ const title = 'Delivery Verification OTP';
   return { success: dbSuccess || fcmResult?.success, fcm: fcmResult };
 }
 
-/**
- * Helper to fetch a user's FCM token from active devices or profile fallback.
- */
 export async function getUserFcmToken(userId) {
   if (!userId) return null;
   try {
@@ -827,9 +836,6 @@ export async function getUserFcmToken(userId) {
   }
 }
 
-/**
- * Check whether an error or status code is considered transient/retryable.
- */
 export function isTransientError(errorOrCode) {
   if (!errorOrCode && errorOrCode !== 0) return false;
   const code = typeof errorOrCode === 'string' || typeof errorOrCode === 'number'
@@ -844,9 +850,6 @@ export function isTransientError(errorOrCode) {
   return category === 'transient';
 }
 
-/**
- * Clear invalid token from profile and deactivate invalid user_devices.
- */
 export async function clearInvalidToken(userId, token) {
   let targetUserId = userId;
   let targetToken = token;
@@ -879,18 +882,6 @@ export async function clearInvalidToken(userId, token) {
   }
 }
 
-// ============================================================================
-// NEW: Prune stale inactive devices
-// ============================================================================
-
-/**
- * Remove device records that have been deactivated for longer than the
- * specified number of days. This keeps the user_devices table clean and
- * prevents accumulation of permanently-invalid tokens.
- *
- * @param {number} days - Number of days after deactivation before pruning (default: 30)
- * @returns {Promise<{ pruned: number }>} Count of pruned device records
- */
 export async function pruneStaleDevices(days = 30) {
   return measureExecution('NotificationService.pruneStaleDevices', async () => {
     if (!supabaseAdmin) {
@@ -926,18 +917,6 @@ export async function pruneStaleDevices(days = 30) {
   });
 }
 
-// ============================================================================
-// NEW: Individual token send helper (for testing/debugging)
-// ============================================================================
-
-/**
- * Send a notification to a single FCM token. Useful for testing individual
- * tokens or for scenarios where batch sending is not appropriate.
- *
- * @param {string} token - The FCM registration token
- * @param {object} payload - Notification payload with optional notification and data
- * @returns {Promise<{ success: boolean, error?: string }>}
- */
 export async function sendToDevice(token, payload) {
   return measureExecution('NotificationService.sendToDevice', async () => {
     if (!firebaseAdmin || !firebaseAdmin.messaging) {
@@ -966,16 +945,6 @@ export async function sendToDevice(token, payload) {
   });
 }
 
-// ============================================================================
-// NEW: Enhanced notification sender with per-device tracking
-// ============================================================================
-
-/**
- * Publish a notification event to Redis channel with structured error logging.
- *
- * @param {object} payload - Notification payload
- * @returns {Promise<boolean>} Whether the publish succeeded
- */
 export async function publishNotification(payload) {
   if (!redisClient) return false;
   try {
@@ -993,14 +962,6 @@ export async function publishNotification(payload) {
 
 export const publishNotificationEvent = publishNotification;
 
-/**
- * Send notification to a user with detailed per-device results.
- * Similar to sendFcmNotification but returns granular results for each device.
- *
- * @param {string} userId - User ID
- * @param {object} payload - Notification payload
- * @returns {Promise<Array>} Array of per-device results
- */
 export async function sendNotification(userId, payload) {
   return measureExecution('NotificationService.sendNotification', async () => {
     if (redisClient) {
@@ -1018,7 +979,6 @@ export async function sendNotification(userId, payload) {
     const tokensSent = new Set();
     const results = [];
 
-    // 1. Query active devices from user_devices
     const activeDevices = await loadActiveDevices(userId);
 
     if (activeDevices && activeDevices.length > 0) {
@@ -1039,7 +999,6 @@ export async function sendNotification(userId, payload) {
       }
     }
 
-    // 2. Profile-level token fallback
     const profileToken = await getProfileFcmToken(userId);
 
     if (profileToken && !tokensSent.has(profileToken)) {
@@ -1050,39 +1009,8 @@ export async function sendNotification(userId, payload) {
         token: tokenFingerprint(profileToken),
         ...result
       });
-
-      if (!result.success && PERMANENT_TOKEN_ERROR_CODES.has(result.error)) {
-        await clearInvalidToken(userId, profileToken);
-      }
     }
-
-    const successCount = results.filter(r => r.success).length;
-    logger.info(
-      `[FCM] sendNotification complete for user ${userId}: ${successCount}/${results.length} devices succeeded`
-    );
 
     return results;
   });
 }
-
-export default {
-  sendFcmNotification,
-  sendPushNotification,
-  insertNotification,
-  sendDeliveryOtpNotification,
-  hashDeliveryOtp,
-  verifyDeliveryOtpHash,
-  storeDeliveryOtp,
-  getActiveDeliveryOtp,
-  verifyDeliveryOtp,
-  expireDeliveryOtps,
-  getUserFcmToken,
-  getFcmTokenForUser: getUserFcmToken,
-  isTransientError,
-  clearInvalidToken,
-  pruneStaleDevices,
-  sendToDevice,
-  sendNotification,
-  publishNotification,
-  publishNotificationEvent,
-};
