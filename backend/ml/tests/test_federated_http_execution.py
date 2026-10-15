@@ -126,6 +126,7 @@ async def test_cancel_or_deadline_retains_native_owner_until_real_fit_finishes(c
         finally:
             finished.set()
     monkeypatch.setattr(keras.Model, 'fit', gated_fit)
+    normal_deadline = execution.ML_INFERENCE_TIMEOUT_SECONDS
     monkeypatch.setattr(execution, 'ML_INFERENCE_TIMEOUT_SECONDS', .05 if deadline else 30)
     async with http_client(app) as http:
         request = asyncio.create_task(http.post('/federated/client/participate', json={'client_id': 'A', 'epochs': 1}))
@@ -137,6 +138,9 @@ async def test_cancel_or_deadline_retains_native_owner_until_real_fit_finishes(c
                 request.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await request
+            # The short deadline applies to the intentionally expired request,
+            # not unrelated normal reads after native ownership is released.
+            monkeypatch.setattr(execution, 'ML_INFERENCE_TIMEOUT_SECONDS', normal_deadline)
             assert not finished.is_set()
             assert (await http.get('/heartbeat')).status_code == 200
             assert (await http.get('/federated/server/stats')).status_code == 503
