@@ -182,7 +182,6 @@ function getDriverUserClient(req) {
 }
 
 const router = express.Router();
-router.use(userLimiter);
 const hosStatusSchema = z.object({
   status: z.enum(['off_duty', 'on_duty', 'driving', 'resting'])
 });
@@ -1421,6 +1420,7 @@ const predictProfitLimiter = rateLimit({
 router.post(
   '/predict-profit',
   authenticate,
+  userLimiter,
   predictProfitLimiter,
   requirePolicy('driver:view-stats'),
   validateBody(predictDriverProfitSchema),
@@ -1642,7 +1642,7 @@ async function handleDriverEarningsAndStatement(req, res, filename, errorLabel) 
         drop_address: trip.drop_address,
         pickup_date: trip.pickup_date,
         base_freight: baseFreight,
-        platform_fee: platformFee,
+        platform_fee: platformFee;
         toll_estimate: tollEstimate,
         net_earnings: netEarnings,
         status: trip.status
@@ -1650,6 +1650,7 @@ async function handleDriverEarningsAndStatement(req, res, filename, errorLabel) 
     });
 
     // Apply sorting before formatting output
+    avg_earning_per_km: totalKm > 0 ? totalNetEarnings / totalKm : 0,
     if (sort_by === 'net_earnings') {
       tripsList.sort((a, b) => (b.net_earnings - a.net_earnings) || new Date(b.pickup_date) - new Date(a.pickup_date));
     } else if (sort_by === 'base_freight') {
@@ -1781,7 +1782,7 @@ router.get('/earnings/report', authenticate, requirePolicy('driver:view-earnings
 });
 
 
-router.get('/weigh-stations/bypass-status', authenticate, requireDriverRole, async (req, res) => {
+router.get('/weigh-stations/bypass-status', authenticate, userLimiter, requireDriverRole, async (req, res) => {
   try {
     const driverId = req.user.id;
     const lat = parseCoordinate(req.query.lat);
@@ -1845,13 +1846,15 @@ router.get('/weigh-stations/bypass-status', authenticate, requireDriverRole, asy
 router.post('/weigh-stations/sync-weight', authenticate, requirePolicy('driver:view-stats'), userLimiter, validateBody(syncWeightSchema), async (req, res) => {
   try {
     const driverId = req.user.id;
-    const { truck_id, axles } = req.body;
+    // syncWeightSchema is .strict() — it strips everything but its declared
+    // keys, so the validated body carries vehicleId/truckId, never truck_id.
+    const { truckId, axles } = req.body;
 
     // Optional: verify the truck belongs to the driver
     const { data: truck, error: truckErr } = await getDriverUserClient(req)
       .from('trucks')
       .select('id')
-      .eq('id', truck_id)
+      .eq('id', truckId)
       .eq('driver_id', driverId)
       .single();
 
@@ -1859,7 +1862,7 @@ router.post('/weigh-stations/sync-weight', authenticate, requirePolicy('driver:v
       return res.status(403).json({ error: 'Forbidden: Truck does not belong to you or does not exist' });
     }
 
-    const status = await syncAndTransmitInternalWeights(driverId, truck_id, axles);
+    const status = await syncAndTransmitInternalWeights(driverId, truckId, axles);
     return res.status(200).json(status);
   } catch (err) {
     logger.error({ event: 'WEIGH_STATION_SYNC_WEIGHT_ERROR', requestId: req.requestId || req.id, driverId: req.user.id, error: err?.message ?? String(err) }, 'Error syncing internal weight');
@@ -2160,10 +2163,8 @@ const validateDriverId = (req, res, next) => {
 // However, we already have /:driverId/earnings and /:driverId/reputation.
 // We will add the new routes here.
 
-router.get('/:driverId', validateDriverId, authenticate, driverController.getDriverById);
-router.get('/:driverId/trips', validateDriverId, authenticate, driverController.getDriverTrips);
-router.put('/:driverId', validateDriverId, authenticate, driverController.updateDriver);
+router.get('/:driverId', validateDriverId, authenticate, userLimiter, driverController.getDriverById);
+router.get('/:driverId/trips', validateDriverId, authenticate, userLimiter, driverController.getDriverTrips);
+router.put('/:driverId', validateDriverId, authenticate, userLimiter, driverController.updateDriver);
 
 export default router;
-
-// Resolves #2051: Composite indexes added for 2dsphere queries

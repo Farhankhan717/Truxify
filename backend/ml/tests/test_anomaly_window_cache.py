@@ -41,6 +41,9 @@ def service():
     engine._generations = {"driver_behavior": 4}
     engine._generation_lock = threading.RLock()
     engine._training_lock = threading.RLock()
+    engine._delivery_lock = threading.RLock()
+    engine._observation_sequence = 0
+    engine._pending_delivery = deque()
     engine._max_feature_buffers = 3
     engine._feature_buffers = OrderedDict()
     engine.anomaly_history = deque(maxlen=1000)

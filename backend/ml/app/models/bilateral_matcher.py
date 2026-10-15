@@ -13,7 +13,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import numpy as np
 import requests
@@ -197,8 +197,14 @@ def _validate_finite_value(
 def _validate_bilateral_inputs(
     loads: List[Dict[str, Any]],
     drivers: List[Dict[str, Any]],
-) -> None:
-    """Validate direct matcher inputs before building the optimization matrix."""
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Own and normalize the problem before routing or scoring can wait.
+
+    Capture is not atomic against unsynchronized caller writes. After it,
+    only private records and immutable admitted floats are used.
+    """
+    loads = [dict(load) for load in tuple(loads)]
+    drivers = [dict(driver) for driver in tuple(drivers)]
     load_ranges = {
         "origin_lat": (-90.0, 90.0),
         "origin_lng": (-180.0, 180.0),
@@ -225,14 +231,14 @@ def _validate_bilateral_inputs(
 
     for load_index, load in enumerate(loads):
         for field_name, (minimum, maximum) in load_ranges.items():
-            _validate_finite_value(
+            load[field_name] = _validate_finite_value(
                 load.get(field_name),
                 f"loads[{load_index}].{field_name}",
                 minimum=minimum,
                 maximum=maximum,
             )
         for field_name in load_positive_fields:
-            _validate_finite_value(
+            load[field_name] = _validate_finite_value(
                 load.get(field_name),
                 f"loads[{load_index}].{field_name}",
                 positive=True,
@@ -240,20 +246,20 @@ def _validate_bilateral_inputs(
 
     for driver_index, driver in enumerate(drivers):
         for field_name, (minimum, maximum) in driver_ranges.items():
-            _validate_finite_value(
+            driver[field_name] = _validate_finite_value(
                 driver.get(field_name),
                 f"drivers[{driver_index}].{field_name}",
                 minimum=minimum,
                 maximum=maximum,
             )
         for field_name in driver_positive_fields:
-            _validate_finite_value(
+            driver[field_name] = _validate_finite_value(
                 driver.get(field_name),
                 f"drivers[{driver_index}].{field_name}",
                 positive=True,
             )
 
-        _validate_finite_value(
+        driver["rating"] = _validate_finite_value(
             driver.get("rating", 3.0),
             f"drivers[{driver_index}].rating",
             minimum=1.0,
@@ -266,12 +272,14 @@ def _validate_bilateral_inputs(
         }.items():
             value = driver.get(field_name)
             if value is not None:
-                _validate_finite_value(
+                driver[field_name] = _validate_finite_value(
                     value,
                     f"drivers[{driver_index}].{field_name}",
                     minimum=minimum,
                     maximum=maximum,
                 )
+
+    return loads, drivers
 
 
 def _distance_cost(driver: dict, load: dict) -> float:
@@ -379,6 +387,43 @@ def _optimal_accepted_pairs(cost: np.ndarray) -> list[tuple[int, int]]:
     return sorted(pairs)
 
 
+
+def _snapshot_bilateral_inputs(
+    loads: List[Dict[str, Any]],
+    drivers: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Freeze the admitted caller records for the rest of the pipeline.
+
+    Validation admits the caller-owned dicts, but routing-matrix construction
+    and the Hungarian pass then read the same mutable objects: a caller thread
+    replacing a value (or the list length changing) between admission and the
+    cost-matrix build silently corrupted the objective. Validated numeric
+    fields are written back as floats — a coordinate string like "0" passed
+    validation but raised TypeError in the Haversine math.
+    """
+    load_numeric_fields = (
+        "origin_lat", "origin_lng", "dest_lat", "dest_lng",
+        "weight_kg", "length_m", "width_m", "height_m", "deadline_hours",
+    )
+    driver_numeric_fields = (
+        "current_lat", "current_lng", "max_weight_kg", "max_length_m",
+        "max_width_m", "max_height_m", "rating",
+        "preferred_dest_lat", "preferred_dest_lng",
+    )
+
+    def _freeze(record: Dict[str, Any], fields) -> Dict[str, Any]:
+        frozen = dict(record)
+        for field in fields:
+            value = frozen.get(field)
+            if value is not None:
+                frozen[field] = float(value)
+        return frozen
+
+    return (
+        [_freeze(load, load_numeric_fields) for load in loads],
+        [_freeze(driver, driver_numeric_fields) for driver in drivers],
+    )
+
 def match_bilateral(
     loads: List[Dict[str, Any]],
     drivers: List[Dict[str, Any]],
@@ -404,7 +449,11 @@ def match_bilateral(
         ``unmatched_loads``  – indices of loads without a match
         ``unmatched_drivers`` – indices of drivers without a match
     """
-    _validate_bilateral_inputs(loads, drivers)
+    loads, drivers = _validate_bilateral_inputs(loads, drivers)
+
+    # Freeze the admitted inputs: the matrix build and Hungarian pass must not
+    # observe caller mutations made after validation.
+    loads, drivers = _snapshot_bilateral_inputs(loads, drivers)
 
     n_loads = len(loads)
     n_drivers = len(drivers)

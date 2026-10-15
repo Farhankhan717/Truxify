@@ -293,7 +293,7 @@ class LocationService {
     // position with an old `timestamp` (after startup, GPS loss, or waking from
     // background). Forwarding it would show the truck where it no longer is.
     if (position.timestamp != null &&
-        DateTime.now().difference(position.timestamp!) > _maxLocationAge) {
+        DateTime.now().difference(position.timestamp) > _maxLocationAge) {
       debugPrint('[LocationService] Stale GPS fix dropped');
       return;
     }
@@ -684,7 +684,9 @@ class LocationService {
               }
             }
           }
-        } catch (_) {}
+        } catch (e) {
+          debugPrint('[LocationService] Failed to process WebSocket message: $e');
+        }
       },
       onError: (error) {
         debugPrint('[LocationService] WebSocket error: $error');

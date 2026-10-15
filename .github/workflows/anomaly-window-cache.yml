@@ -2,9 +2,11 @@ name: Native anomaly temporal cache
 on:
   pull_request:
     paths:
-      - backend/ml/anomaly/detector.py
+      - backend/ml/anomaly/**
       - backend/ml/tests/test_anomaly_window_cache.py
       - backend/ml/tests/test_anomaly_generation_contract.py
+      - backend/ml/tests/test_anomaly_reporting.py
+      - backend/ml/tests/test_autoencoder_shared_topology.py
       - .github/workflows/anomaly-window-cache.yml
   workflow_dispatch:
 permissions:
@@ -35,8 +37,9 @@ jobs:
         run: >-
           python -m pytest backend/ml/tests/test_anomaly_window_cache.py
           backend/ml/tests/test_anomaly_generation_contract.py
-          backend/ml/tests/test_autoencoder_shared_topology.py -q
+          backend/ml/tests/test_autoencoder_shared_topology.py
+          backend/ml/tests/test_anomaly_reporting.py -q
       - name: Scoped source analysis
         run: |
-          python -m ruff check backend/ml/tests/test_anomaly_window_cache.py backend/ml/tests/test_anomaly_generation_contract.py
+          python -m ruff check backend/ml/tests/test_anomaly_window_cache.py backend/ml/tests/test_anomaly_generation_contract.py backend/ml/tests/test_anomaly_reporting.py
           python -m ruff check backend/ml/anomaly/detector.py --ignore I001,F401,UP035,UP006,UP045,RUF013,PERF102,DTZ005,BLE001
