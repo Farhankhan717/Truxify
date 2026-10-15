@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 
-import '../../models/app_models.dart';
 import '../models/app_models.dart';
 import '../services/order_service.dart';
 import '../utils/driver_utils.dart';
@@ -50,7 +49,7 @@ class _DesktopOrdersTableState extends State<DesktopOrdersTable> {
         vertical: 6,
       ),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.12),
+        color: color.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(20),
       ),
       child: Text(

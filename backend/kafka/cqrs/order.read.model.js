@@ -1,6 +1,61 @@
 import { supabaseAdmin } from '../../api/src/config/db.js';
 import logger from '../../api/src/middleware/logger.js';
 import eventRepository from '../repositories/event.repository.js';
+// backend/kafka/cqrs/order.read.model.js
+
+import { ORDER_STATUSES } from '../../api/src/config/constants.js'; // Ensure correct import path
+import { supabaseAdmin } from '../../api/src/config/db.js';
+
+/**
+ * Computes per-status order counts using the canonical ORDER_STATUSES.
+ */
+export async function getOrderStats() {
+  const statuses = ORDER_STATUSES;
+  const stats = {};
+
+  for (const status of statuses) {
+    const { count, error } = await supabaseAdmin
+      .from('order_read_model')
+      .select('*', { count: 'exact', head: true })
+      .eq('status', status);
+
+    if (error) {
+      throw new Error(`Failed to fetch order count for status ${status}: ${error.message}`);
+    }
+
+    stats[status] = count || 0;
+  }
+
+  return stats;
+}
+
+/**
+ * Retrieves orders from the read model with clean, uncorrupted filters.
+ */
+export async function getAllOrdersReadModel(filters = {}) {
+  let query = supabaseAdmin.from('order_read_model').select('*');
+
+  if (filters.customerId) {
+    query = query.eq('payload->>customer_id', filters.customerId);
+  }
+
+  if (filters.driverId) {
+    // Corrected to use text extraction operator ->> matching driverId
+    query = query.eq('payload->>driver_id', filters.driverId);
+  }
+
+  if (filters.status) {
+    query = query.eq('status', filters.status);
+  }
+
+  const { data, error } = await query;
+
+  if (error) {
+    throw new Error(`Failed to query order read model: ${error.message}`);
+  }
+
+  return data;
+}
 import {
   ORDER_READ_MODEL_TABLE,
   ORDER_STATUSES,
@@ -298,10 +353,6 @@ class OrderReadModel {
       }
       if (filters.driverId) {
         query = query.eq('payload->>driver_id', filters.driverId);
-        query = query.eq('payload->customer_id', filters.customerId);
-      }
-      if (filters.driverId) {
-        query = query.eq('payload->driver_id', filters.driverId);
       }
       if (filters.fromDate) {
         query = query.gte('updated_at', filters.fromDate);
@@ -345,24 +396,6 @@ class OrderReadModel {
    */
   async getOrderStats() {
     const statuses = ORDER_STATUSES;
-   * Per-status order counts from the canonical `status` column of the single
-   * authoritative read model (the same column getOrderList filters on).
-   */
-    async getOrderStats() {
-    const statuses = [
-      'pending',
-      'created',
-      'truck_assigned',
-      'assigned',
-      'en_route_pickup',
-      'arrived_pickup',
-      'picked_up',
-      'in_transit',
-      'arriving',
-      'delivered',
-      'payment_released',
-      'cancelled',
-    ];
 
     const stats = {};
 

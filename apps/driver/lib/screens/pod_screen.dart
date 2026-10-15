@@ -19,13 +19,13 @@ class ProofOfDeliveryScreen extends StatefulWidget {
   final Future<void> Function(String? photoPath, String? signaturePath)? onComplete;
 
   const ProofOfDeliveryScreen({
-    Key? key,
+    super.key,
     required this.tripDisplayId,
     required this.stopId,
     this.orderId,
     this.earnings,
     this.onComplete,
-  }) : super(key: key);
+  });
 
   @override
   State<ProofOfDeliveryScreen> createState() => _ProofOfDeliveryScreenState();
@@ -133,8 +133,10 @@ class _ProofOfDeliveryScreenState extends State<ProofOfDeliveryScreen> {
         double? lng;
         try {
           final position = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.high,
-            timeLimit: const Duration(seconds: 4),
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.high,
+              timeLimit: Duration(seconds: 4),
+            ),
           );
           lat = position.latitude;
           lng = position.longitude;
@@ -163,6 +165,7 @@ class _ProofOfDeliveryScreenState extends State<ProofOfDeliveryScreen> {
         // If geofence failed, request manual OTP
         if (!paymentReleased) {
           _updateStatus('Awaiting OTP verification...');
+          if (!mounted) return;
           final enteredOtp = await showDialog<String>(
             context: context,
             barrierDismissible: false,

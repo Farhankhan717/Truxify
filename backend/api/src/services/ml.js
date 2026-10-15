@@ -2,70 +2,127 @@ import logger from '../middleware/logger.js';
 import { mlMatchingGateway } from './mlMatchingGateway.js';
 import { validatePricePrediction, convertToPaisa } from '../lib/predictionValidator.js';
 import { LRUCache } from '../utils/cache.js';
-import { Router } from 'express';
-import { matchEnRouteLoads } from '../services/ml.js';
-import db from '../db/index.js';
-import logger from '../middleware/logger.js';
-
-const router = Router();
-
-/**
- * GET /api/orders/load-offers
- * Returns all available load offers for the driver marketplace.
- */
-router.get('/load-offers', async (req, res, next) => {
-  try {
-    const { rows: offers } = await db.query(
-      `SELECT * FROM load_offers WHERE status = 'available' ORDER BY created_at DESC LIMIT 100`
-    );
-    res.json(offers);
-  } catch (err) {
-    logger.error({ err }, '[API] Failed to fetch load offers');
-    next(err);
-  }
-});
-
-/**
- * GET /api/orders/load-offers/en-route
- * Returns en-route load recommendations filtered by driver location and maximum detour.
- * Query params: current_lat, current_lng, max_detour_km
- */
-router.get('/load-offers/en-route', async (req, res, next) => {
-  try {
-    const currentLat = parseFloat(req.query.current_lat);
-    const currentLng = parseFloat(req.query.current_lng);
-    const maxDetourKm = req.query.max_detour_km ? parseFloat(req.query.max_detour_km) : 50;
-
-    if (isNaN(currentLat) || isNaN(currentLng)) {
-      return res.status(400).json({
-        error: 'Query parameters current_lat and current_lng are required and must be valid numbers.',
-      });
-    }
-
-    // Fetch active load offers from the database
-    const { rows: offers } = await db.query(
-      `SELECT * FROM load_offers WHERE status = 'available'`
-    );
-
-    // Process through ML en-route matcher (includes built-in haversine fallback)
-    const enrichedOffers = await matchEnRouteLoads({
-      currentLat,
-      currentLng,
-      offers,
-      maxDetourKm,
-    });
-
-    res.json(enrichedOffers);
-  } catch (err) {
-    logger.error({ err }, '[API] Failed to fetch en-route load offers');
-    next(err);
-  }
-});
-
-export default router;
 const demandCache = new LRUCache(100, 15 * 60 * 1000);
 const priceCache = new LRUCache(100, 15 * 60 * 1000);
+// backend/api/src/services/ml.js
+import axios from 'axios';
+import logger from '../middleware/logger.js';
 
+const ML_BASE_URL = process.env.ML_SERVICE_URL || 'http://localhost:8000';
+const ML_API_KEY = process.env.ML_API_KEY || '';
+
+function getHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    ...(ML_API_KEY ? { 'X-API-Key': ML_API_KEY } : {})
+  };
+}
+
+async function handleResponse(responsePromise, url = '', method = 'GET') {
+  try {
+    const response = await responsePromise;
+    return response.data;
+  } catch (error) {
+    const status = error.response?.status;
+    const errorMsg = error.response?.data?.error || error.message;
+    
+    if (status === 401 || status === 403) {
+      logger.error({ status, url, method, err: errorMsg }, `[ML] Authentication failed (${status}) for ${method} ${url}`);
+      throw new Error(`[ML] Authentication failed (${status})`);
+    }
+    
+    logger.error({ status, url, method, err: errorMsg }, `[ML] Request failed (${status || 'network'}) for ${method} ${url}`);
+    throw new Error(`[ML] Request failed (${status || 'network'})`);
+  }
+}
+
+export function parseWeightKgSafe(value) {
+  if (value === undefined || value === null) return 0;
+  const cleaned = String(value).replace(/[^0-9.]/g, '');
+  const normalized = cleaned.replace(/(\..*?)\..*/g, '$1');
+  const parsed = parseFloat(normalized);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export async function predictDriverProfit(params) {
+  const url = `${ML_BASE_URL}/predict/profit`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function predictDemand(features) {
+  const url = `${ML_BASE_URL}/predict/demand`;
+  return handleResponse(axios.post(url, features, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function predictPrice(params) {
+  const url = `${ML_BASE_URL}/predict/price`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function predictEta(params) {
+  const url = `${ML_BASE_URL}/predict/eta`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function matchDeadhead(params) {
+  const url = `${ML_BASE_URL}/match/deadhead`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function matchEnRouteLoads(params) {
+  const url = `${ML_BASE_URL}/match/en-route`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function optimisePacking(params) {
+  const url = `${ML_BASE_URL}/optimise/packing`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function recommendLoads(params) {
+  const url = `${ML_BASE_URL}/recommend/loads`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function recommendTrucks(params) {
+  const url = `${ML_BASE_URL}/recommend/trucks`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function scoreTrust(params) {
+  const url = `${ML_BASE_URL}/score/trust`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function matchBilateral(params) {
+  const url = `${ML_BASE_URL}/match/bilateral`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function optimiseMidTrip(params) {
+  const url = `${ML_BASE_URL}/optimise/mid-trip`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function trainDemandModel(params) {
+  const url = `${ML_BASE_URL}/train/demand`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function trainPriceModel(params) {
+  const url = `${ML_BASE_URL}/train/price`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function listModels() {
+  const url = `${ML_BASE_URL}/models`;
+  return handleResponse(axios.get(url, { headers: getHeaders(), timeout: 5000 }), url, 'GET');
+}
+
+export const __testing = {
+  getHeaders,
+  handleResponse
+};
 // Single source of truth for ML engine base URL
 const DEFAULT_ML_ENGINE_URL = 'http://localhost:8001';
 
@@ -539,8 +596,6 @@ export async function matchDeadhead({ driverDestination, truckSpecs, arrivalTime
     }
     return result;
   });
-
-  return handleResponse(response, url, 'POST');
 }
 
 /**

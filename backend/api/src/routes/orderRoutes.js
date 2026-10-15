@@ -139,6 +139,23 @@
  *         duration_minutes:
  *           type: number
  */
+// backend/api/src/routes/orderRoutes.js
+
+import { authenticate } from '../middleware/auth.js';
+import { userLimiter } from '../middleware/rateLimiter.js';
+import { handleGeofenceConfirm } from '../controllers/orderController.js'; // Or relevant controller function
+
+// Before:
+// router.post('/api/deliveries/:id/geofence-confirm', handleGeofenceConfirm);
+
+// After:
+router.post('/:id/geofence-confirm', authenticate, userLimiter, async (req, res, next) => {
+  try {
+    await handleGeofenceConfirm(req, res);
+  } catch (err) {
+    next(err);
+  }
+});
 
 import express from 'express';
 import multer from 'multer';
@@ -206,6 +223,52 @@ import {
 } from '../controllers/orderController.js';
 import { getRouteEstimate, getRouteGeometry, buildStraightLineGeometry } from '../services/osrm.js';
 import { computeOrderPricing } from '../lib/pricing.js';
+import { escrowLockManager } from '../lib/escrow/escrowLockManager.js';
+// backend/api/src/routes/orderRoutes.js
+import { Router } from 'express';
+import { 
+  createOrderSchema, 
+  submitBidSchema, 
+  submitRatingSchema, 
+  acceptBidParamsSchema, 
+  updateMilestoneSchema 
+} from '../schemas/orderSchemas.js';
+import { validateBody, validateParams } from '../middleware/validation.js';
+import { requirePolicy } from '../middleware/auth.js';
+import * as orderController from '../controllers/orderController.js'; // or corresponding service handlers
+
+const router = Router();
+
+// --- Core Order Management ---
+
+// POST /api/orders (Create order)
+router.post(
+  '/',
+  requirePolicy('customer:create'),
+  validateBody(createOrderSchema),
+  orderController.createOrder
+);
+
+// GET /api/orders/my/active (Customer active orders)
+router.get(
+  '/my/active',
+  requirePolicy('customer:read'),
+  orderController.getActiveOrders
+);
+
+// GET /api/orders/load-offers (Load offers)
+router.get(
+  '/load-offers',
+  requirePolicy('driver:read'),
+  orderController.getLoadOffers
+);
+
+// GET /api/orders/load-offers/en-route (En-route load offers)
+router.get(
+  '/load-offers/en-route',
+  requirePolicy('driver:read'),
+  orderController.getEnRouteLoadOffers
+);
 import {
   validatePodFile,
   generatePodStoragePath,
@@ -213,6 +276,61 @@ import {
   createPodSignedUrl
 } from '../lib/storage/podStorage.js';
 
+// GET /api/orders/:id (Order detail)
+router.get(
+  '/:id',
+  requirePolicy('order:read'),
+  orderController.getOrderById
+);
+
+// GET /api/orders/:id/timeline
+router.get(
+  '/:id/timeline',
+  requirePolicy('order:read'),
+  orderController.getOrderTimeline
+);
+
+// --- Bidding & Ratings ---
+
+// POST /api/orders/:id/bids (Submit bid)
+router.post(
+  '/:id/bids',
+  requirePolicy('driver:bid'),
+  validateBody(submitBidSchema),
+  orderController.submitBid
+);
+
+// GET /api/orders/:id/bids
+router.get(
+  '/:id/bids',
+  requirePolicy('order:read'),
+  orderController.getOrderBids
+);
+
+// POST /api/orders/:id/accept-bid
+router.post(
+  '/:id/accept-bid',
+  requirePolicy('customer:update'),
+  orderController.acceptBid
+);
+
+// POST /api/orders/:id/ratings
+router.post(
+  '/:id/ratings',
+  requirePolicy('order:rate'),
+  validateBody(submitRatingSchema),
+  orderController.submitRating
+);
+
+// PUT /api/orders/:id/milestones
+router.put(
+  '/:id/milestones',
+  requirePolicy('driver:update'),
+  validateBody(updateMilestoneSchema),
+  orderController.updateMilestones
+);
+
+export default router;
 const router = express.Router();
 const MAX_GEOFENCE_RADIUS_M = 500;
 
@@ -769,47 +887,6 @@ router.get('/:id/bids', authenticate, userLimiter, requireRole(['customer']), va
     }
   }
 }); 
-// Path 1: Already funded or confirmation path handling
-if (alreadyFunded) {
-  const { data: updatedData, error: updateErr } = await orderRepository.updateOrderWithFilter(
-    orderId, 
-    {
-      escrow_status: 'funded',
-      escrow_funding_error: null,
-      version: order.version + 1,
-      updated_at: new Date().toISOString(),
-    }, 
-    [
-      { op: 'eq', column: 'escrow_status', value: 'funding' },
-      { op: 'eq', column: 'version', value: order.version }
-    ], 
-    'id'
-  );
-
-  if (updateErr) {
-    return res.status(500).json({ success: false, error: updateErr.message });
-  }
-} else {
-  // Path 2: Standard confirm deposit success path
-  const { data: updatedData, error: updateErr } = await orderRepository.updateOrderWithFilter(
-    orderId, 
-    {
-      escrow_status: 'funded',
-      escrow_funding_error: null,
-      version: order.version + 1,
-      updated_at: new Date().toISOString(),
-    }, 
-    [
-      { op: 'eq', column: 'escrow_status', value: 'funding' },
-      { op: 'eq', column: 'version', value: order.version }
-    ], 
-    'id'
-  );
-
-  if (updateErr) {
-    return res.status(500).json({ success: false, error: updateErr.message });
-  }
-}
 router.post('/:id/confirm-deposit', authenticate, async (req, res, next) => {
      const orderId = req.params.id;
      
@@ -882,11 +959,6 @@ router.post('/:id/confirm-deposit', authenticate, async (req, res, next) => {
    });
 
 
-//  ============================================================================
-//  18a. SUBMIT BID FOR A LOAD (DRIVER) — POST /api/orders/:id/bids
-//  18b. VIEW BIDS FOR AN ORDER (CUSTOMER) — GET /api/orders/:id/bids
-//  18c. ACCEPT A BID (CUSTOMER) — POST /api/orders/:id/bids/:bidId/accept
-});
 
 //  ============================================================================
 //  18a. SUBMIT BID FOR A LOAD (DRIVER) — POST /api/orders/:id/bids
@@ -1181,4 +1253,11 @@ router.post('/:id/ratings', authenticate, userLimiter, requirePolicy('order:subm
 });
 
 
+
+// backend/api/src/routes/orderRoutes.js (around line 1194)
+
+// Before:
+// module.exports = router;
+
+// After:
 export default router;
