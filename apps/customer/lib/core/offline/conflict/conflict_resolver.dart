@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart';
+
 import '../models/trip_event.dart';
 
 class ConflictResolutionResult {
@@ -25,7 +27,7 @@ class ConflictResolver {
         supersededIds: supersededIds,
       );
     } catch (err, stack) {
-      print('[ConflictResolver Error] Failed in resolveWithDetails: $err\n$stack');
+      debugPrint('[ConflictResolver Error] Failed in resolveWithDetails: $err\n$stack');
       return ConflictResolutionResult(resolved: events, supersededIds: []);
     }
   }
@@ -154,7 +156,6 @@ class ConflictResolver {
           ..._attachmentRows(mergedPayload['attachments']),
           ..._attachmentRows(incomingPayload['attachments']),
         ]) {
-          if (item is! Map<String, dynamic>) continue;
           final hash = '${item['name'] ?? ''}:${item['hash'] ?? ''}';
           if (!seen.contains(hash)) {
             seen.add(hash);

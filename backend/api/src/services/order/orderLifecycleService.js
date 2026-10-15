@@ -31,7 +31,13 @@ const osrmCircuitBreaker = new CircuitBreaker('osrmRouting', {
   resetTimeoutMs: 15000,
   requestTimeoutMs: 5000,
 });
+// Before:
+// module.exports.createOrderTransactional = createOrderTransactional;
 
+// After:
+export { createOrderTransactional };
+// or export it directly on the function definition:
+// export async function createOrderTransactional(...) { ... }
 const mlPriceCircuitBreaker = new CircuitBreaker('mlPricePrediction', {
   failureThreshold: 3,
   resetTimeoutMs: 15000,
@@ -184,7 +190,7 @@ export class OrderLifecycleService {
       const MAX_ID_RETRIES = ORDER_DISPLAY_ID_MAX_RETRIES;
       let order = null;
       let orderErr = null;
-      let orderDisplayId = null;
+      let orderDisplayId;
 
       for (let attempt = 0; attempt < MAX_ID_RETRIES; attempt++) {
         orderDisplayId = generateOrderDisplayId();
@@ -205,7 +211,6 @@ export class OrderLifecycleService {
           payment_method_id, upi_id,
           waypoints: optimizedWaypoints,
         });
-
         order = result.data;
         orderErr = result.error;
 
@@ -215,10 +220,22 @@ export class OrderLifecycleService {
 
       if (orderErr) {
         logger.error('Order Insertion Error:', orderErr.message);
-        throw new DomainError(500, { error: 'Failed to create order record.', details: orderErr.message });
+        throw new DomainError(500, {
+          error: 'Failed to create order record.',
+          details: orderErr.message
+        });
       }
 
-      const { error: timelineErr } = await this.orderTimelineService.generateDefaultTimeline(orderDisplayId);
+      if (!order) {
+        throw new DomainError(500, {
+          error: 'Failed to create order record.'
+        });
+      }
+
+      const { error: timelineErr } =
+        await this.orderTimelineService.generateDefaultTimeline(orderDisplayId);
+
+
 
       if (timelineErr) {
         logger.error('Timeline Insertion Error:', timelineErr.message);
@@ -387,7 +404,10 @@ export class OrderLifecycleService {
 
       try {
         const { data: offer, error: offerErr } = await this.orderRepository.findLoadOfferById(loadOfferId, 'id, status, customer_id');
-        if (offerErr || !offer) throw new DomainError(404, { error: 'Load offer not found.' });
+        // A database error is not 'not found' — collapsing the two masks
+        // outages as 404s and breaks client retry semantics.
+        if (offerErr) throw new DomainError(500, { error: 'Failed to load the load offer.' });
+        if (!offer) throw new DomainError(404, { error: 'Load offer not found.' });
         if (offer.status !== 'available') throw new DomainError(410, { error: 'Load is no longer available for bidding.' });
         if (offer.customer_id === driverId) throw new DomainError(403, { error: 'You cannot bid on your own load offer' });
 

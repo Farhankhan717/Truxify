@@ -44,7 +44,6 @@ class _HomeScreenState extends State<HomeScreen> {
       widget.cacheManager ?? CacheManager();
   late final OrderService _orderService;
   late final ProfileService _profileService;
-  bool _isOffline = false;
   bool _isLoading = true;
   String? _error;
   String _locationLabel = 'Surat, Gujarat';
@@ -71,7 +70,6 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!mounted) return;
 
     setState(() {
-      _isOffline = !hasNetwork;
       if (cachedLocation != null) {
         _locationLabel =
             'Last truck location • ${cachedLocation['latitude']?.toStringAsFixed(3)}, ${cachedLocation['longitude']?.toStringAsFixed(3)}';
@@ -143,7 +141,7 @@ class _HomeScreenState extends State<HomeScreen> {
       final drop = order['drop_address']?.toString() ?? '';
       if (pickup.isEmpty || drop.isEmpty) continue;
 
-      final key = '${pickup}|||${drop}';
+      final key = '$pickup|||$drop';
       final existing = routeMap[key];
       final dateStr = order['pickup_date']?.toString() ?? '';
 

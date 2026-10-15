@@ -10,8 +10,8 @@ typedef UploadProgressCallback = void Function(String status, {double? progress}
 
 class SyncService {
   static final SyncService instance = SyncService._init();
-  TripService _tripService;
-  ApiClient _apiClient;
+  final TripService _tripService;
+  final ApiClient _apiClient;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
   bool _isSyncing = false;
 
@@ -123,7 +123,7 @@ class SyncService {
     final files = <MultipartFileInfo>[];
 
     if (hasSignature) {
-      final file = File(signaturePath!);
+      final file = File(signaturePath);
       final bytes = await file.readAsBytes();
       files.add(MultipartFileInfo(
         fieldName: 'signature',
@@ -133,7 +133,7 @@ class SyncService {
     }
 
     if (hasPhoto) {
-      final file = File(photoPath!);
+      final file = File(photoPath);
       final bytes = await file.readAsBytes();
       files.add(MultipartFileInfo(
         fieldName: 'photo',

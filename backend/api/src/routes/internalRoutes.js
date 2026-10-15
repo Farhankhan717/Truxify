@@ -362,8 +362,44 @@ router.post('/defensive-pause', async (req, res) => {
  *   get:
  *     tags: [Internal]
  *     summary: Retrieve complete dispute evidence package for an unconfirmed or disputed order
+ *     parameters:
+ *       - name: orderId
+ *         in: path
+ *         required: true
+ *         description: Order identifier (UUID or display id) to retrieve dispute evidence for.
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Dispute evidence package.
+ *       400:
+ *         description: orderId parameter is required.
+ *       404:
+ *         description: Order not found.
+ *       500:
+ *         description: Failed to retrieve order metadata.
+ *       503:
+ *         description: Database client is not available.
  *     security:
  *       - ApiKeyAuth: []
+ *     parameters:
+ *       - name: orderId
+ *         in: path
+ *         required: true
+ *         description: Order UUID or order display id.
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Dispute evidence package (order, parties, GPS trail, OTP logs, geofence validation)
+ *       401:
+ *         description: Missing or invalid API key
+ *       404:
+ *         description: Order not found
+ *       500:
+ *         description: Failed to retrieve order metadata
+ *       503:
+ *         description: Database client is not available
  */
 router.get('/dispute-evidence/:orderId', async (req, res) => {
   const { orderId } = req.params;
@@ -509,6 +545,27 @@ router.get('/dispute-evidence/:orderId', async (req, res) => {
  *     summary: Check data readiness for ML model retraining
  *     security:
  *       - ApiKeyAuth: []
+ *     parameters:
+ *       - name: since
+ *         in: query
+ *         required: false
+ *         description: Only count data updated at or after this date/time. Defaults to 7 days ago.
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *     responses:
+ *       200:
+ *         description: Training readiness snapshot
+ *       400:
+ *         description: since is not a valid date
+ *       401:
+ *         description: Missing or invalid API key
+ *       500:
+ *         description: Failed to evaluate training readiness
+ *       502:
+ *         description: Failed to query completed orders count
+ *       503:
+ *         description: Database is not configured
  */
 router.get('/training-readiness', async (req, res) => {
   try {
@@ -518,9 +575,11 @@ router.get('/training-readiness', async (req, res) => {
     }
 
     const sinceParam = req.query.since;
-    const cutoffDate = sinceParam
-      ? new Date(sinceParam).toISOString()
-      : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const since = sinceParam ? new Date(sinceParam) : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    if (typeof sinceParam === 'object' || Number.isNaN(since.getTime())) {
+      return res.status(400).json({ error: 'since must be a valid date.' });
+    }
+    const cutoffDate = since.toISOString();
 
     // Query completed orders since cutoff
     const { count: completedOrdersCount, error: ordersErr } = await client
@@ -617,6 +676,36 @@ router.post('/escrow/freeze', async (req, res) => {
  *     summary: Release escrow payment upon dispute resolution
  *     security:
  *       - ApiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               bookingId:
+ *                 type: string
+ *                 description: Order UUID or display id (orderId accepted as an alias)
+ *               orderId:
+ *                 type: string
+ *                 description: Alias of bookingId
+ *     responses:
+ *       200:
+ *         description: Escrow released (idempotent — alreadyReleased=true when previously released)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean }
+ *                 message: { type: string }
+ *                 bookingId: { type: string }
+ *                 txHash: { type: string, nullable: true }
+ *                 alreadyReleased: { type: boolean }
+ *       400:
+ *         description: bookingId missing
+ *       500:
+ *         description: Release failed (details carry the upstream error message)
  */
 router.post('/escrow/release', async (req, res) => {
   const bookingId = req.body?.bookingId || req.body?.orderId;

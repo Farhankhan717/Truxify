@@ -1,4 +1,6 @@
 import logging
+from threading import RLock
+from .optimizer_transition import operation_owned, optimizer_transition
 import math
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -42,7 +44,8 @@ class MultiHeadAttention(nn.Module):
     
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
         super().__init__()
-        assert d_model % num_heads == 0
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
         
         self.d_model = d_model
         self.num_heads = num_heads
@@ -278,22 +281,28 @@ class FoundationModelTrainer:
         )
         
         self.criterion = nn.CrossEntropyLoss()
+        self._operation_lock = RLock()
         
         logger.info(f"✅ Trainer initialized on {self.device}")
     
+    @operation_owned
     def train_step(self, batch: Dict, task: str = 'classification') -> Dict:
-        """One native update using the explicitly selected finetuning objective."""
         batch = own_batch(batch, self.model, self.config, task)
-        self.model.train()
-        self.optimizer.zero_grad()
-        output = self.model(batch['input_ids'], batch['attention_mask'], task=task)['output']
-        loss = objective(output, batch['labels'], task)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
-        self.scheduler.step()
-        return {'loss': loss.item(), 'lr': self.optimizer.param_groups[0]['lr']}
+        with optimizer_transition(self.model, self.optimizer, self.scheduler):
+            self.model.train()
+            self.optimizer.zero_grad()
+            output = self.model(batch['input_ids'], batch['attention_mask'], task=task)['output']
+            loss = objective(output, batch['labels'], task)
+            if loss.ndim != 0 or not torch.isfinite(loss):
+                raise ValueError('supervised objective must be a finite scalar')
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0, error_if_nonfinite=True)
+            self.optimizer.step()
+            self.scheduler.step()
+            result = {'loss': loss.item(), 'lr': self.optimizer.param_groups[0]['lr']}
+        return result
 
+    @operation_owned
     def train(self, train_data: List[Dict], val_data: Optional[List[Dict]] = None,
               task: str = 'classification', epochs: Optional[int] = None) -> Dict:
         """Admit both complete collections before the first native update."""
@@ -324,6 +333,7 @@ class FoundationModelTrainer:
             'final_val_loss': val_losses[-1] if val_losses else None,
         }
 
+    @operation_owned
     def validate(self, val_data: List[Dict], task: str = 'classification') -> float:
         length, batch_size, _ = policy(self.model, self.config)
         records = own_records(val_data, self.model, length, task)

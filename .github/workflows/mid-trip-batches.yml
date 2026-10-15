@@ -4,6 +4,7 @@ on:
     paths:
       - backend/ml/app/models/mid_trip_reoptimiser.py
       - backend/ml/tests/test_mid_trip_batches.py
+      - backend/ml/tests/test_mid_trip_reachability.py
       - .github/workflows/mid-trip-batches.yml
   workflow_dispatch:
 permissions:
@@ -30,7 +31,8 @@ jobs:
           backend/ml/tests/test_mid_trip_deadline_insertion.py
           backend/ml/tests/test_mid_trip_payment_validation.py
           backend/ml/tests/test_mid_trip_road_eta.py
-          backend/ml/tests/test_mid_trip_model.py -q
+          backend/ml/tests/test_mid_trip_model.py
+          backend/ml/tests/test_mid_trip_reachability.py -q
       - name: Scoped source analysis
         run: |
           python -m ruff check backend/ml/tests/test_mid_trip_batches.py
