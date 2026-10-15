@@ -2,11 +2,12 @@ name: Native federated update delivery
 on:
   pull_request:
     paths:
-      - backend/ml/federated/federated_server.py
-      - backend/ml/federated/update_delivery.py
-      - backend/ml/tests/test_federated_update_delivery.py
-      - backend/ml/tests/test_federated.py
-      - .github/workflows/federated-update-delivery.yml
+      - 'backend/ml/federated/**'
+      - 'backend/ml/routes/federated_routes.py'
+      - 'backend/ml/tests/test_federated*.py'
+      - 'docs/architecture/federated*.md'
+      - 'docs/ml/federated*.md'
+      - '.github/workflows/federated-update-delivery.yml'
   workflow_dispatch:
 permissions:
   contents: read
