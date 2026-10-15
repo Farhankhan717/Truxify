@@ -71,6 +71,30 @@ void main() {
     expect(find.text('Please select a drop location.'), findsNothing);
   });
 
+  testWidgets('rebooking an ISO pickup date preserves its date and time', (WidgetTester tester) async {
+    final controller = TruxifyController();
+    controller.openFindTrucks(
+      draft: RouteDraft(
+        pickup: 'Surat, Gujarat',
+        drop: 'Jaipur, Rajasthan',
+        dateLabel: DateTime(2030, 5, 17, 14, 30).toIso8601String(),
+        goodsType: 'Textile',
+        weightTonnes: '3',
+        dimensions: '12 × 6 × 6',
+        stacked: true,
+        fragile: false,
+        requirements: const [],
+      ),
+    );
+
+    await tester.pumpWidget(createTestWidget(tester, controller: controller));
+    await tester.pumpAndSettle();
+
+    expect(find.text('17 May 2030'), findsOneWidget);
+    expect(find.text('2:30 PM'), findsOneWidget);
+    expect(find.text('Tomorrow'), findsNothing);
+  });
+
   testWidgets('missing pickup location shows error and prevents submission', (WidgetTester tester) async {
     await tester.pumpWidget(createTestWidget(tester));
     await tester.pumpAndSettle();
@@ -83,13 +107,12 @@ void main() {
     pickupField.controller?.text = '';
     await tester.pumpAndSettle();
 
-    // Click Find Trucks
-    await tester.tap(find.byType(PrimaryButton));
-    await tester.pumpAndSettle();
-
-    // Verify error is shown
-    expect(find.text('Please select a pickup location.'), findsOneWidget);
-    // Verify it did not navigate
+    // With the validity-gated submit (73b195a44), an invalid form DISABLES
+    // the button — submission is prevented before any tap can validate.
+    // The read-only location/date fields' inline errors are unreachable in
+    // this flow; the observable contract is: disabled button, no navigation.
+    final submit = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
+    expect(submit.onPressed, isNull);
     expect(find.byType(TruckResultsScreen), findsNothing);
   });
 
@@ -105,13 +128,12 @@ void main() {
     dropField.controller?.text = '';
     await tester.pumpAndSettle();
 
-    // Click Find Trucks
-    await tester.tap(find.byType(PrimaryButton));
-    await tester.pumpAndSettle();
-
-    // Verify error is shown
-    expect(find.text('Please select a drop location.'), findsOneWidget);
-    // Verify it did not navigate
+    // With the validity-gated submit (73b195a44), an invalid form DISABLES
+    // the button — submission is prevented before any tap can validate.
+    // The read-only location/date fields' inline errors are unreachable in
+    // this flow; the observable contract is: disabled button, no navigation.
+    final submit = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
+    expect(submit.onPressed, isNull);
     expect(find.byType(TruckResultsScreen), findsNothing);
   });
 
@@ -130,12 +152,14 @@ void main() {
     await tester.pumpAndSettle();
 
     // Click Find Trucks
-    await tester.tap(find.byType(PrimaryButton));
     await tester.pumpAndSettle();
 
-    // Verify error is shown
-    expect(find.text('Pickup and drop locations cannot be the same.'), findsAtLeastNWidgets(1));
-    // Verify it did not navigate
+    // With the validity-gated submit (73b195a44), an invalid form DISABLES
+    // the button — submission is prevented before any tap can validate.
+    // The read-only location/date fields' inline errors are unreachable in
+    // this flow; the observable contract is: disabled button, no navigation.
+    final submit = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
+    expect(submit.onPressed, isNull);
     expect(find.byType(TruckResultsScreen), findsNothing);
   });
 
@@ -146,16 +170,17 @@ void main() {
     final weightFinder = findTextFieldByLabel('Weight (t)');
     expect(weightFinder, findsOneWidget);
 
-    // Enter empty weight
-    await tester.enterText(weightFinder, '');
+    // Enter a whitespace-only weight: the field starts empty, so clearing
+    // it fires no onChanged — a real change drives the live validator
+    // (_onWeightChanged → _weightErrorText).
+    await tester.enterText(weightFinder, ' ');
     await tester.pumpAndSettle();
 
-    // Click Find Trucks
-    await tester.tap(find.byType(PrimaryButton));
-    await tester.pumpAndSettle();
-
-    // Verify error is shown
+    // Live error is shown without submitting; the validity-gated button
+    // stays disabled.
     expect(find.text('Weight must be greater than 0.'), findsAtLeastNWidgets(1));
+    final submit = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
+    expect(submit.onPressed, isNull);
     // Verify it did not navigate
     expect(find.byType(TruckResultsScreen), findsNothing);
   });
@@ -241,13 +266,12 @@ void main() {
     await tester.pumpWidget(createTestWidget(tester, controller: controller));
     await tester.pumpAndSettle();
 
-    // Click Find Trucks
-    await tester.tap(find.byType(PrimaryButton));
-    await tester.pumpAndSettle();
-
-    // Verify error is shown
-    expect(find.text('Please select a future pickup date.'), findsOneWidget);
-    // Verify it did not navigate
+    // With the validity-gated submit (73b195a44), an invalid form DISABLES
+    // the button — submission is prevented before any tap can validate.
+    // The read-only location/date fields' inline errors are unreachable in
+    // this flow; the observable contract is: disabled button, no navigation.
+    final submit = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
+    expect(submit.onPressed, isNull);
     expect(find.byType(TruckResultsScreen), findsNothing);
   });
 }

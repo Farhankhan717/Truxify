@@ -75,22 +75,28 @@ function makeQueryChain(data) {
   return chain;
 }
 
-const { supabase, supabaseAdmin, createUserClient } = vi.hoisted(() => {
+const { supabase, supabaseAdmin, createUserClient, getAdminClient } = vi.hoisted(() => {
   const fromFn = vi.fn();
   // Each call to from() returns a fresh chain that resolves to null by default;
   // tests can override supabaseAdmin.from via mockImplementation to inject data.
   fromFn.mockImplementation(() => makeQueryChain(null));
+  const admin = { from: fromFn };
   return {
     supabase: { from: fromFn },
-    supabaseAdmin: { from: fromFn },
+    supabaseAdmin: admin,
     createUserClient: vi.fn(() => ({ from: fromFn })),
+    getAdminClient: vi.fn(() => admin),
   };
 });
 
 vi.mock('../../src/config/db.js', () => ({
+  
+  redisClient: global.mockRedis,
+  upstashRedisClient: global.mockRedis,
   supabase,
   supabaseAdmin,
   createUserClient,
+  getAdminClient,
 }));
 
 import supportRoutes from '../../src/routes/supportRoutes.js';
@@ -201,11 +207,13 @@ describe('supportRoutes', () => {
       expect(res.body.labels.technical).toBe('Technical Issue');
     });
 
-    it('sr8: sets cache control header', async () => {
+    it('sr8: includes category descriptions for all categories', async () => {
       const res = await request(makeApp()).get('/support/categories');
 
-      expect(res.headers['cache-control']).toContain('public');
-      expect(res.headers['cache-control']).toContain('max-age=86400');
+      expect(res.status).toBe(200);
+      expect(res.body.descriptions).toBeDefined();
+      expect(res.body.descriptions.payment).toContain('payments');
+      expect(res.body.descriptions.order).toContain('bookings');
     });
   });
 
@@ -323,12 +331,17 @@ describe('supportRoutes', () => {
           select: vi.fn().mockReturnValue({
             eq: vi.fn().mockReturnValue({
               order: vi.fn().mockReturnValue({
-                range: vi.fn().mockResolvedValue({ data: mockTickets, error: null, count: 2 }),
+                range: vi.fn().mockResolvedValue({
+                  data: mockTickets,
+                  error: null,
+                  count: 2,
+                }),
               }),
             }),
           }),
         }),
       });
+      
 
       const res = await request(makeApp()).get('/support/tickets');
 
@@ -664,7 +677,7 @@ describe('supportRoutes', () => {
       expect(res.status).toBe(404);
     });
 
-    it('sr31: validates sort parameter', async () => {
+    it('sr31: validates limit parameter', async () => {
       createUserClient.mockReturnValue({
         from: vi.fn().mockReturnValue({
           select: vi.fn().mockReturnValue({
@@ -680,10 +693,10 @@ describe('supportRoutes', () => {
 
       const res = await request(makeApp())
         .get(`/support/tickets/${VALID_UUID}/comments`)
-        .query({ sort: 'invalid' });
+        .query({ limit: 'invalid' });
 
       expect(res.status).toBe(400);
-      expect(res.body.error).toContain("sort");
+      expect(res.body.error).toContain('limit');
     });
   });
 

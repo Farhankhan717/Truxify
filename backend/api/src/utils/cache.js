@@ -17,13 +17,17 @@ export class LRUCache {
    * @returns {any} The cached value or undefined
    */
   get(key) {
+    if (key == null) {
+      return undefined;
+    }
+
     if (!this.cache.has(key)) {
       return undefined;
     }
 
     const item = this.cache.get(key);
     
-    if (Date.now() > item.expiresAt) {
+    if (Date.now() >= item.expiresAt) {
       this.cache.delete(key);
       return undefined;
     }
@@ -43,12 +47,22 @@ export class LRUCache {
    * @param {number} ttlMs Optional TTL in milliseconds override
    */
   set(key, value, ttlMs = this.defaultTtlMs) {
+    if (key == null) {
+      return;
+    }
+
     if (this.cache.has(key)) {
       this.cache.delete(key);
     } else if (this.cache.size >= this.capacity) {
-      // Evict the first item (least recently used)
-      const firstKey = this.cache.keys().next().value;
-      this.cache.delete(firstKey);
+      // TTL order can differ from LRU order, so reclaim expired entries first.
+      const now = Date.now();
+      for (const [cachedKey, item] of this.cache) {
+        if (now >= item.expiresAt) this.cache.delete(cachedKey);
+      }
+      if (this.cache.size >= this.capacity) {
+        const firstKey = this.cache.keys().next().value;
+        this.cache.delete(firstKey);
+      }
     }
 
     this.cache.set(key, {
@@ -62,6 +76,9 @@ export class LRUCache {
    * @param {string} key 
    */
   invalidate(key) {
+    if (key == null) {
+      return;
+    }
     this.cache.delete(key);
   }
 

@@ -49,4 +49,14 @@ describe('index.js structure', () => {
     const content = fs.readFileSync(indexPath, 'utf-8');
     expect(content).toContain('escrowReleaseReconciliation');
   });
+
+  it('invokes waitForMongoDb and initWebSocketServer exactly once', () => {
+    const content = fs.readFileSync(indexPath, 'utf-8');
+    const waitForMongoDbMatches = content.match(/waitForMongoDb\(\)/g) || [];
+    const initWebSocketServerMatches = content.match(/initWebSocketServer\(/g) || [];
+
+    expect(waitForMongoDbMatches.length).toBe(1);
+    // Import statements carry no parens, so each pattern matches its single call.
+    expect(initWebSocketServerMatches.length).toBe(1);
+  });
 });

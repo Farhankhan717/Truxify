@@ -50,7 +50,7 @@
  */
 
 import express from 'express';
-import { supabaseAdmin } from '../config/db.js';
+import { supabaseAdmin, redisClient } from '../config/db.js';
 import { authenticate, requireRole } from '../middleware/auth.js';
 import { requirePolicy } from '../middleware/requirePolicy.js';
 import { userLimiter } from '../middleware/rateLimiter.js';
@@ -60,6 +60,8 @@ import { validateBody, validateParams, validateQuery } from '../middleware/valid
 import { paramIdSchema } from '../validation/requestSchemas.js';
 import { escapeLike } from '../lib/escapeLike.js';
 import { invalidateBookingCaches } from '../utils/cacheInvalidation.js';
+import { formatPaginationMeta } from '../utils/pagination.js';
+import { estimateTripProfit } from '../services/tripProfitEstimator.js';
 
 
 const router = express.Router();
@@ -169,12 +171,15 @@ router.get('/', authenticate, userLimiter, requirePolicy('load-offer:browse'), v
     }
     const vehicleType = req.query.vehicle_type || '';
     if (vehicleType && vehicleType.toLowerCase() !== 'truck') {
+      const pagination = formatPaginationMeta(0, page, limit);
       return res.json({
-        page,
-        limit,
-        total: 0,
-        totalPages: 0,
-        loads: []
+        page: pagination.page,
+        limit: pagination.limit,
+        total: pagination.total,
+        totalPages: pagination.totalPages,
+        loads: [],
+        data: [],
+        pagination
       });
     }
 
@@ -208,7 +213,13 @@ router.get('/', authenticate, userLimiter, requirePolicy('load-offer:browse'), v
 
     // Filters
     if (req.query.pickup_location) {
-      const pickupLocation = (Array.isArray(req.query.pickup_location) ? req.query.pickup_location[0] : req.query.pickup_location).trim();
+      if (Array.isArray(req.query.pickup_location)) {
+        return res.status(400).json({ error: 'Repeated pickup_location parameters are not allowed' });
+      }
+      if (typeof req.query.pickup_location !== 'string') {
+        return res.status(400).json({ error: 'pickup_location must be a single string' });
+      }
+      const pickupLocation = req.query.pickup_location.trim();
       if (!pickupLocation) {
         return res.status(400).json({ error: 'pickup_location must not be empty' });
       }
@@ -218,7 +229,13 @@ router.get('/', authenticate, userLimiter, requirePolicy('load-offer:browse'), v
       query = query.ilike('pickup_address', `%${escapeLike(pickupLocation)}%`);
     }
     if (req.query.destination) {
-      const destination = (Array.isArray(req.query.destination) ? req.query.destination[0] : req.query.destination).trim();
+      if (Array.isArray(req.query.destination)) {
+        return res.status(400).json({ error: 'Repeated destination parameters are not allowed' });
+      }
+      if (typeof req.query.destination !== 'string') {
+        return res.status(400).json({ error: 'destination must be a string' });
+      }
+      const destination = req.query.destination.trim();
       if (!destination) {
         return res.status(400).json({ error: 'destination must not be empty' });
       }
@@ -291,12 +308,18 @@ router.get('/', authenticate, userLimiter, requirePolicy('load-offer:browse'), v
       vehicle_type: 'Truck'
     }));
 
+    const pagination = formatPaginationMeta(count || 0, page, limit);
+
     res.json({
-      page,
-      limit,
-      total: count || 0,
-      totalPages: Math.ceil((count || 0) / limit),
-      loads: formattedLoads
+      success: true,
+      page: pagination.page,
+      limit: pagination.limit,
+      total: pagination.total,
+      totalPages: pagination.totalPages,
+      hasNextPage: pagination.hasNextPage,
+      loads: formattedLoads,
+      data: formattedLoads,
+      pagination
     });
 
   } catch (err) {
@@ -351,6 +374,283 @@ router.post('/', authenticate, userLimiter, requireRole(['customer']), validateB
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+
+// ============================================================================
+// 1.8 GET LOAD STATISTICS (DRIVER)
+// GET /api/loads/stats
+// ============================================================================
+/**
+ * @openapi
+ * /api/loads/stats:
+ *   get:
+ *     tags: [Loads]
+ *     summary: Get aggregate load metrics
+ *     description: Returns aggregate marketplace load statistics including active loads, average/min/max freight price, average distance, and nearby loads. Cached for 60 seconds.
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: vehicleType
+ *         schema:
+ *           type: string
+ *         description: Optional vehicle type filter (e.g., mini_truck, truck)
+ *     responses:
+ *       200:
+ *         description: Aggregate load statistics
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 vehicleType:
+ *                   type: string
+ *                 activeLoads:
+ *                   type: integer
+ *                 avgFreightPrice:
+ *                   type: number
+ *                 minFreightPrice:
+ *                   type: number
+ *                 maxFreightPrice:
+ *                   type: number
+ *                 avgDistance:
+ *                   type: number
+ *                 nearbyLoads:
+ *                   type: integer
+ *                 lastUpdated:
+ *                   type: string
+ */
+router.get('/stats', authenticate, userLimiter, requirePolicy('load-offer:browse'), async (req, res) => {
+  const vehicleType = req.query.vehicleType || req.query.vehicle_type || null;
+
+  if (vehicleType && typeof vehicleType !== 'string') {
+    return res.status(400).json({ error: 'vehicleType must be a string' });
+  }
+
+  const normalizedVehicle = vehicleType ? vehicleType.trim() : null;
+  const cacheKey = `loads:stats:${normalizedVehicle ? normalizedVehicle.toLowerCase() : 'all'}`;
+
+  // Check Redis cache (60s TTL)
+  if (redisClient) {
+    try {
+      const cached = await redisClient.get(cacheKey);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        return res.json({ success: true, ...parsed });
+      }
+    } catch (cacheErr) {
+      logger.warn({ err: cacheErr.message }, 'Failed to read load stats from Redis cache');
+    }
+  }
+
+  try {
+    let statsData = null;
+
+    // 1. Try Supabase RPC get_load_stats
+    if (supabaseAdmin && typeof supabaseAdmin.rpc === 'function') {
+      const { data, error } = await supabaseAdmin.rpc('get_load_stats', {
+        p_vehicle_type: normalizedVehicle,
+      });
+
+      if (!error && data) {
+        try {
+          statsData = typeof data === 'string' ? JSON.parse(data) : data;
+        } catch (parseErr) {
+          logger.warn({ err: parseErr.message }, 'Failed to parse load stats from Supabase RPC');
+        }
+      }
+    }
+
+    // 2. Fallback to direct DB query if RPC is not available or failed
+    if (!statsData) {
+      let query = supabaseAdmin
+        .from('load_offers')
+        .select('freight_value, extra_distance_km')
+        .eq('status', 'available');
+
+      const { data: rows, error } = await query;
+
+      if (error) {
+        logger.error('Failed to fetch load stats from DB:', error);
+        return res.status(500).json({ error: 'Failed to fetch load statistics' });
+      }
+
+      const activeLoads = rows ? rows.length : 0;
+      let sumFreight = 0;
+      let minFreight = activeLoads > 0 ? Infinity : 0;
+      let maxFreight = 0;
+      let sumDistance = 0;
+      let distanceCount = 0;
+      let nearbyLoads = 0;
+
+      for (const row of rows || []) {
+        const valInr = (Number(row.freight_value) || 0) / 100;
+        sumFreight += valInr;
+        if (valInr < minFreight) minFreight = valInr;
+        if (valInr > maxFreight) maxFreight = valInr;
+
+        if (row.extra_distance_km !== null && row.extra_distance_km !== undefined) {
+          const dist = Number(row.extra_distance_km) || 0;
+          sumDistance += dist;
+          distanceCount++;
+          if (dist <= 50) nearbyLoads++;
+        } else {
+          nearbyLoads++;
+        }
+      }
+
+      statsData = {
+        vehicleType: normalizedVehicle || 'all',
+        activeLoads,
+        avgFreightPrice: activeLoads > 0 ? Number((sumFreight / activeLoads).toFixed(2)) : 0,
+        minFreightPrice: minFreight === Infinity ? 0 : minFreight,
+        maxFreightPrice: maxFreight,
+        avgDistance: distanceCount > 0 ? Number((sumDistance / distanceCount).toFixed(2)) : 0,
+        nearbyLoads,
+        lastUpdated: new Date().toISOString(),
+      };
+    }
+
+    // Cache in Redis for 60 seconds
+    if (redisClient && statsData) {
+      try {
+        await redisClient.set(cacheKey, JSON.stringify(statsData), 'EX', 60);
+      } catch (cacheSetErr) {
+        logger.warn({ err: cacheSetErr.message }, 'Failed to cache load stats in Redis');
+      }
+    }
+
+    return res.json({ success: true, ...statsData });
+  } catch (err) {
+    logger.error('Internal Server Error in GET /api/loads/stats:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+
+// ============================================================================
+// 2.5 GET PROFIT ESTIMATE FOR A LOAD (DRIVER)
+// GET /api/loads/:id/profit-estimate
+// ============================================================================
+/**
+ * @openapi
+ * /api/loads/{id}/profit-estimate:
+ *   get:
+ *     tags: [Loads]
+ *     summary: Estimated net profit breakdown for a load offer
+ *     description: >
+ *       Returns a deterministic, driver-facing profit estimate for a specific
+ *       load offer before the driver accepts it. All values are estimates and
+ *       `isEstimate` is always `true`. Query parameters override the default
+ *       cost configuration (fuel price, truck mileage, toll rate, other costs).
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Load offer UUID
+ *       - in: query
+ *         name: distance_km
+ *         schema:
+ *           type: number
+ *         description: Override route distance in km (uses load's extra_distance_km if not provided)
+ *       - in: query
+ *         name: fuel_price_per_litre
+ *         schema:
+ *           type: number
+ *         description: Diesel price per litre in ₹
+ *       - in: query
+ *         name: truck_km_per_litre
+ *         schema:
+ *           type: number
+ *         description: Truck mileage in km/litre
+ *       - in: query
+ *         name: toll_rate_per_km
+ *         schema:
+ *           type: number
+ *         description: Toll rate per km in ₹
+ *       - in: query
+ *         name: other_cost_per_km
+ *         schema:
+ *           type: number
+ *         description: Other trip expenses per km in ₹
+ *     responses:
+ *       200:
+ *         description: Estimated profit breakdown
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 freightAmount:
+ *                   type: number
+ *                 estimatedFuelCost:
+ *                   type: number
+ *                 estimatedTollCost:
+ *                   type: number
+ *                 otherCosts:
+ *                   type: number
+ *                 estimatedNetProfit:
+ *                   type: number
+ *                 profitPerKm:
+ *                   type: number
+ *                 distanceKm:
+ *                   type: number
+ *                 isEstimate:
+ *                   type: boolean
+ *                   enum: [true]
+ *       404:
+ *         description: Load offer not found or no longer available
+ */
+router.get('/:id/profit-estimate', authenticate, userLimiter, requirePolicy('load-offer:browse'), validateParams(paramIdSchema), async (req, res) => {
+  try {
+    const { data: load, error } = await supabaseAdmin
+      .from('load_offers')
+      .select('freight_value, extra_distance_km')
+      .eq('id', req.params.id)
+      .eq('status', 'available')
+      .maybeSingle();
+
+    if (error) {
+      logger.error('Failed to fetch load offer for profit estimate:', error);
+      return res.status(500).json({ error: 'Failed to fetch load offer.' });
+    }
+    if (!load) {
+      return res.status(404).json({ error: 'Load offer not found or no longer available.' });
+    }
+
+    // Resolve distance: explicit query param > load's extra_distance_km > 0
+    const distanceKm =
+      parseFloat(req.query.distance_km) ||
+      parseFloat(load.extra_distance_km) ||
+      0;
+
+    const freightAmountInr = (Number(load.freight_value) || 0) / 100;
+
+    const configOverrides = {};
+    if (req.query.fuel_price_per_litre)  configOverrides.fuelPricePerLitre = parseFloat(req.query.fuel_price_per_litre);
+    if (req.query.truck_km_per_litre)    configOverrides.truckKmPerLitre   = parseFloat(req.query.truck_km_per_litre);
+    if (req.query.toll_rate_per_km)      configOverrides.tollRatePerKm     = parseFloat(req.query.toll_rate_per_km);
+    if (req.query.other_cost_per_km)     configOverrides.otherCostPerKm    = parseFloat(req.query.other_cost_per_km);
+
+    const breakdown = estimateTripProfit({
+      freightAmountInr,
+      distanceKm,
+      config: configOverrides,
+    });
+
+    return res.json(breakdown);
+  } catch (err) {
+    logger.error('Internal Server Error in GET /api/loads/:id/profit-estimate:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 
 // ============================================================================
 // 2. GET SINGLE LOAD OFFER BY ID (DRIVER)

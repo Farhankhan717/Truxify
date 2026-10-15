@@ -39,6 +39,9 @@ on:
         type: choice
         options: ['false', 'true']
 
+permissions:
+  contents: read
+
 concurrency:
   group: truxify-analysis
   cancel-in-progress: false
@@ -55,7 +58,7 @@ jobs:
       driver: ${{ steps.changes.outputs.driver }}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 2
 
@@ -113,7 +116,7 @@ jobs:
       changed: ${{ steps.analyze.outputs.changed }}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
 
@@ -147,7 +150,7 @@ jobs:
       changed: ${{ steps.analyze.outputs.changed }}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
 
@@ -177,7 +180,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Write hash files and commit
         run: |

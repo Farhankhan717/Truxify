@@ -11,6 +11,7 @@ import { PolicyError, policy } from '../security/policyEngine.js';
 import logger from '../middleware/logger.js';
 
 const router = express.Router();
+const BLOCKCHAIN_TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 const oracleVerificationLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
@@ -53,7 +54,7 @@ router.get('/status', authenticate, async (req, res) => {
       data: status
     });
   } catch (error) {
-    logger.error({ requestId: req.requestId }, '[OracleRoutes] Status error:', error?.message || error);
+    logger.error({ requestId: req.requestId, event: 'ORACLE_STATUS_ERROR', error: error?.message || String(error) }, 'Status error');
     res.status(500).json({
       success: false,
       error: 'Internal Server Error'
@@ -84,7 +85,7 @@ router.post('/confirm', oracleVerificationLimiter, authenticate, validateBody(or
       });
     }
 
-    logger.error({ requestId: req.requestId }, '[OracleRoutes] Confirm error:', error?.message || error);
+    logger.error({ requestId: req.requestId, event: 'ORACLE_CONFIRM_ERROR', error: error?.message || String(error) }, 'Confirm error');
     res.status(500).json({
       success: false,
       error: 'Internal Server Error'
@@ -95,6 +96,14 @@ router.post('/confirm', oracleVerificationLimiter, authenticate, validateBody(or
 router.post('/verify-crosschain', oracleVerificationLimiter, authenticate, validateBody(oracleVerifyCrosschainSchema), async (req, res) => {
   try {
     const { orderId, blockchainHash } = req.body;
+
+    if (!BLOCKCHAIN_TX_HASH_RE.test(blockchainHash)) {
+      return res.status(400).json({
+        success: false,
+        error: 'blockchainHash must be a 0x-prefixed 32-byte hex string'
+      });
+    }
+
     await authorizeOrderAccess(req, orderId);
 
     const result = await oracleService.verifyCrossChain(orderId, blockchainHash);
@@ -111,7 +120,7 @@ router.post('/verify-crosschain', oracleVerificationLimiter, authenticate, valid
       });
     }
 
-    logger.error({ requestId: req.requestId }, '[OracleRoutes] Verify-crosschain error:', error?.message || error);
+    logger.error({ requestId: req.requestId, event: 'ORACLE_VERIFY_CROSSCHAIN_ERROR', error: error?.message || String(error) }, 'Verify-crosschain error');
     res.status(500).json({
       success: false,
       error: 'Internal Server Error'
