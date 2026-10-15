@@ -24,7 +24,6 @@ export class AuthConfig {
     this.timestampHeaderName = (process.env.API_TIMESTAMP_HEADER || 'x-timestamp').toLowerCase();
     
     // Security Policies
-    this.allowQueryParam = process.env.ALLOW_API_KEY_IN_QUERY === 'true'; // Default false (anti-pattern)
     this.requireHmac = process.env.REQUIRE_HMAC_SIGNATURE === 'true';
     this.signatureMaxAgeMs = safeInt(process.env.SIGNATURE_MAX_AGE_MS, 300000);
     this.enableRateLimiting = process.env.ENABLE_RATE_LIMITING !== 'false';
@@ -511,6 +510,26 @@ export const requireScopes = (...requiredScopes) => {
   };
 };
 
+export const requireEscrowOperatorKey = (req, res, next) => {
+  const configuredKeys = (process.env.ESCROW_OPERATOR_API_KEYS || '')
+    .split(',')
+    .map((key) => key.trim())
+    .filter(Boolean);
+  const presentedKey = req.apiKeyMetadata?.rawKey;
+
+  if (!configuredKeys.length) {
+    return res.status(503).json({
+      error: 'Service Unavailable: escrow operator authentication is not configured.',
+    });
+  }
+
+  if (!presentedKey || !configuredKeys.some((key) => safeCompare(presentedKey, key))) {
+    return res.status(403).json({ error: 'Forbidden: escrow operator key required.' });
+  }
+
+  next();
+};
+
 // ============================================================================
 // FILE: src/middleware/ipWhitelist.js
 // Description: IP Restriction Filter
@@ -544,11 +563,13 @@ export const enforceIpWhitelist = (req, res, next) => {
  * IP filtering, and zero-downtime key rotation.
  */
 export const requireApiKey = (req, res, next) => {
-  // 1. Extract API Key from Headers (or Query if explicitly enabled)
+  authConfig.reload();
+
+  // 1. Extract API Key from Headers only
   let apiKey = req.headers[authConfig.keyHeaderName];
 
-  if (!apiKey && authConfig.allowQueryParam && req.query) {
-    apiKey = req.query.api_key || req.query.apiKey;
+  if (Array.isArray(apiKey)) {
+    apiKey = apiKey[0];
   }
 
   // 2. Load environment keys into repository if empty
@@ -569,7 +590,7 @@ export const requireApiKey = (req, res, next) => {
   // 4. Missing Key Check
   if (!apiKey) {
     AuditLogger.logFailure(req, 'Missing API Key in request headers', 'missing_api_key');
-    return res.status(401).json({ error: 'Unauthorized: Missing API Key' });
+    return res.status(401).json({ error: 'Missing API Key' });
   }
 
   // 5. Lookup Key Metadata via Repository (or Timing-Safe Dynamic Evaluation)

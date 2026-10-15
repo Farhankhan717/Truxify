@@ -7,6 +7,7 @@ const m = createSupabaseMock();
 
 vi.mock('../../src/config/db.js', () => ({
   supabase: m.supabase,
+  supabaseAdmin: m.supabase,
   firebaseAdmin: null,
   redisClient: null,
   mongoDb: null,
@@ -28,6 +29,11 @@ function buildApp() {
   const app = express();
   app.use(express.json());
   app.use('/api/orders', orderRouter);
+  // Mirror production: domain/app errors serialize as JSON, not the
+  // express default HTML error page.
+  app.use((err, req, res, _next) => {
+    res.status(err.status || err.statusCode || 500).json({ error: err.message });
+  });
   return app;
 }
 

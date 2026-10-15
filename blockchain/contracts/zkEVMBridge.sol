@@ -6,7 +6,9 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 interface IzkEVM {
     function depositToL2() external payable;
+    function depositToL2(address user) external payable;
     function withdrawFromL2(uint256 amount, bytes calldata proof) external;
+    function withdrawFromL2(address user, uint256 amount, bytes calldata proof) external;
     function getBalance(address user) external view returns (uint256);
 }
 
@@ -32,41 +34,43 @@ contract zkEVMBridge is Ownable, ReentrancyGuard {
         depositedAmount[msg.sender] += amount;
         collectedFees += bridgeFee;
 
-        // Deposit to L2
-        zkEVM.depositToL2{value: amount}();
+        // Preserve the original user address in the L2 balance.
+        zkEVM.depositToL2{value: amount}(msg.sender);
 
         emit BridgeDeposit(msg.sender, amount, bridgeFee);
     }
 
     mapping(bytes32 => bool) public usedProofs;
 
-function withdrawFromL2(
-    uint256 amount,
-    bytes calldata proof
-) external nonReentrant {
-    require(proof.length > 0, "Empty proof");
-    require(amount > 0, "Amount must be > 0");
-    require(depositedAmount[msg.sender] >= amount, "Exceeds deposited amount");
+    function withdrawFromL2(
+        uint256 amount,
+        bytes calldata proof
+    ) external nonReentrant {
+        require(proof.length > 0, "Empty proof");
+        require(amount > 0, "Amount must be > 0");
+        require(depositedAmount[msg.sender] >= amount, "Exceeds deposited amount");
 
-    bytes32 proofHash = keccak256(proof);
-    require(!usedProofs[proofHash], "Proof already used");
-    usedProofs[proofHash] = true;
+        bytes32 proofHash = keccak256(proof);
+        require(!usedProofs[proofHash], "Proof already used");
+        usedProofs[proofHash] = true;
 
-    // Withdraw from L2 — proof is verified inside zkEVM.withdrawFromL2
-    zkEVM.withdrawFromL2(amount, proof);
+        // Pass the original user through to zkEVM so proof binding is checked
+        // against the user rather than this bridge contract.
+        zkEVM.withdrawFromL2(msg.sender, amount, proof);
 
-    depositedAmount[msg.sender] -= amount;
-    pendingWithdrawals[msg.sender] += amount;
+        depositedAmount[msg.sender] -= amount;
+        pendingWithdrawals[msg.sender] += amount;
 
-    emit BridgeWithdraw(msg.sender, amount);
-}
+        emit BridgeWithdraw(msg.sender, amount);
+    }
 
     function claimWithdrawal() external nonReentrant {
         uint256 amount = pendingWithdrawals[msg.sender];
         require(amount > 0, "No pending withdrawal");
 
         pendingWithdrawals[msg.sender] = 0;
-        payable(msg.sender).transfer(amount);
+        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        require(success, "Withdrawal transfer failed");
     }
 
     function setBridgeFee(uint256 newFee) external onlyOwner {
@@ -81,7 +85,8 @@ function withdrawFromL2(
         uint256 amount = collectedFees;
         require(amount > 0, "No fees to withdraw");
         collectedFees = 0;
-        payable(owner()).transfer(amount);
+        (bool success, ) = payable(owner()).call{value: amount}("");
+        require(success, "Fee withdrawal failed");
     }
 
     receive() external payable {

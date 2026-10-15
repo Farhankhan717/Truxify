@@ -1,146 +1,241 @@
 import logging
+import math
 import random
-from datetime import datetime
-from typing import Dict, Any, Optional
-from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer
-from sqlalchemy.orm import declarative_base
-from sqlalchemy.orm import sessionmaker
+from datetime import datetime, timezone
+from typing import Any
+
 import pandas as pd
-import json
+from app.models.base import get_active_generation
+from app.models.demand_forecast import MODEL_NAME as DEMAND_MODEL_NAME
+from app.models.demand_forecast import reset_model_cache
+from services.ab_experiment_ledger import ExperimentLedger
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Float,
+    Integer,
+    String,
+    create_engine,
+    inspect,
+    text,
+)
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 logger = logging.getLogger(__name__)
 Base = declarative_base()
 
+
 class ABTestMetrics(Base):
-    __tablename__ = 'ab_test_metrics'
-    
+    __tablename__ = "ab_test_metrics"
+
     id = Column(Integer, primary_key=True)
     model_version = Column(String(50))
     test_id = Column(String(100))
     metric_name = Column(String(50))
     metric_value = Column(Float)
     sample_size = Column(Integer)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(
+        DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
     request_id = Column(String(100))
+    status = Column(String(30), default="active")
+
 
 class ABTestModel:
     """A/B Testing with shadow deployment and auto-rollback"""
-    
+
     def __init__(self, db_url: str, threshold: float = 0.95):
         self.engine = create_engine(db_url)
         Base.metadata.create_all(self.engine)
+        if "status" not in {
+            column["name"]
+            for column in inspect(self.engine).get_columns("ab_test_metrics")
+        }:
+            with self.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "ALTER TABLE ab_test_metrics ADD COLUMN status VARCHAR(30) DEFAULT 'active'"
+                    )
+                )
         self.Session = sessionmaker(bind=self.engine)
         self.threshold = threshold  # If new model < threshold% of old, rollback
         self.traffic_split = 0.10  # 10% to new model
-        
-    def get_model_for_request(self, request_id: str) -> Dict[str, Any]:
+        self._test_states: dict[
+            str, dict[str, Any]
+        ] = {}  # Legacy compatibility; never authoritative.
+        self.ledger = ExperimentLedger(
+            self.engine,
+            self.Session,
+            ABTestMetrics,
+            lambda: self.get_production_version(),
+        )
+
+    def get_model_for_request(self, request_id: str) -> dict[str, Any]:
         """Route request to production or shadow model based on A/B split"""
-        
-        # Get current test configuration
         test_config = self.get_active_test()
-        
+
         if not test_config:
             return {
-                'model': 'production',
-                'version': self.get_production_version(),
-                'test_id': None
+                "model": "production",
+                "version": self.get_production_version(),
+                "test_id": None,
             }
-        
-        # A/B Split: 90% production, 10% shadow
-        is_shadow = random.random() < self.traffic_split
-        
-        return {
-            'model': 'shadow' if is_shadow else 'production',
-            'version': test_config['shadow_version'] if is_shadow else test_config['production_version'],
-            'test_id': test_config['test_id'],
-            'is_shadow': is_shadow
-        }
-    
-    def log_metrics(self, test_id: str, model_version: str, metrics: Dict[str, float], request_id: str):
-        """Log performance metrics for analysis"""
-        session = self.Session()
-        
-        for metric_name, value in metrics.items():
-            metric = ABTestMetrics(
-                model_version=model_version,
-                test_id=test_id,
-                metric_name=metric_name,
-                metric_value=value,
-                sample_size=1,
-                request_id=request_id,
-                timestamp=datetime.utcnow()
-            )
-            session.add(metric)
-        
-        session.commit()
-        session.close()
-    
-    def evaluate_test(self, test_id: str) -> Dict[str, Any]:
-        """Compare performance of production vs shadow model"""
-        session = self.Session()
-        
-        try:
-            # Get metrics for both models
-            metrics = session.query(ABTestMetrics).filter(
-                ABTestMetrics.test_id == test_id
-            ).all()
-            
-            df = pd.DataFrame([{
-                'model_version': m.model_version,
-                'metric_name': m.metric_name,
-                'metric_value': m.metric_value
-            } for m in metrics])
-            
-            if df.empty:
-                return {'error': 'No metrics found'}
-            
-            # Calculate average metrics per model
-            results = {}
-            # Shadow metrics are logged under the real shadow model version
-            # (e.g. 'eta_v1'), not the literal bucket name 'shadow'. Derive
-            # the shadow bucket from the versions actually logged for this
-            # test so the A/B comparison measures the real models.
-            logged_versions = df['model_version'].unique()
-            shadow_version = next(
-                (v for v in logged_versions if v != 'production'),
-                'shadow'
-            )
-            for metric in df['metric_name'].unique():
-                metric_df = df[df['metric_name'] == metric]
-                avg_metrics = metric_df.groupby('model_version')['metric_value'].mean()
-                
-                prod_val = avg_metrics.get('production', None)
-                shadow_val = avg_metrics.get(shadow_version, None)
-                lower_is_better_keywords = {'rmse', 'mae', 'mse', 'loss', 'error_rate', 'latency', 'error'}
-                higher_is_better = not any(k in metric.lower() for k in lower_is_better_keywords)
 
-                results[metric] = {
-                    'production': prod_val,
-                    'shadow': shadow_val,
-                    'improvement': self.calculate_improvement(
-                        prod_val if prod_val is not None else 0.0,
-                        shadow_val if shadow_val is not None else 0.0,
-                        higher_is_better=higher_is_better
-                    )
+        is_shadow = random.random() < self.traffic_split
+        return {
+            "model": "shadow" if is_shadow else "production",
+            "version": test_config["shadow_version"]
+            if is_shadow
+            else test_config["production_version"],
+            "test_id": test_config["test_id"],
+            "is_shadow": is_shadow,
+        }
+
+    def log_metrics(
+        self,
+        test_id: str,
+        model_version: str,
+        metrics: dict[str, float],
+        request_id: str,
+    ):
+        """Atomically bind experiment identity and admit a complete metric batch."""
+        return self.ledger.log(test_id, model_version, metrics, request_id)
+
+    def evaluate_test(self, test_id: str) -> dict[str, Any]:
+        """Compare one coherent native ledger identity/metric snapshot."""
+        with self.ledger.transaction() as session:
+            state = self.ledger._ensure(session, test_id)
+            metrics = session.query(ABTestMetrics).filter(
+                ABTestMetrics.test_id == test_id).all()
+            return self._evaluate_snapshot(
+                test_id, self.ledger.snapshot(state) if state else None, metrics)
+
+    def _evaluate_snapshot(self, test_id, test_state, metrics):
+        df = pd.DataFrame(
+            [
+                {
+                    "model_version": m.model_version,
+                    "metric_name": m.metric_name,
+                    "metric_value": m.metric_value,
                 }
-            
-            # Determine if shadow model is better
-            is_better = self.is_shadow_better(results)
-            
+                for m in metrics
+            ]
+        )
+
+        if df.empty:
+            return {"error": "No metrics found"}
+
+        results = {}
+        logged_versions = df["model_version"].unique()
+        if not test_state or not test_state.get("production_version"):
             return {
-                'test_id': test_id,
-                'results': results,
-                'shadow_better': is_better,
-                'should_rollback': not is_better,
-                'timestamp': datetime.utcnow().isoformat()
+                "test_id": test_id,
+                "results": {},
+                "has_comparison": False,
+                "shadow_better": False,
+                "should_rollback": False,
+                "error": "Legacy experiment identities are ambiguous",
             }
-        finally:
-            session.close()
-    
+        prod_version = test_state["production_version"]
+        shadow_version = test_state.get("shadow_version")
+
+        # Keep evaluating legacy tests whose metrics used the old literal
+        # production label, while new tests compare real generations.
+        if prod_version not in logged_versions and "production" in logged_versions:
+            prod_version = "production"
+
+        for metric in df["metric_name"].unique():
+            metric_df = df[df["metric_name"] == metric]
+            avg_metrics = metric_df.groupby("model_version")["metric_value"].mean()
+
+            prod_val = avg_metrics.get(prod_version, None)
+            shadow_val = avg_metrics.get(shadow_version, None)
+
+            lower_is_better_keywords = {
+                "rmse",
+                "mae",
+                "mse",
+                "loss",
+                "error_rate",
+                "latency",
+                "error",
+            }
+            higher_is_better = not any(
+                k in metric.lower() for k in lower_is_better_keywords
+            )
+
+            results[metric] = {
+                "production": prod_val,
+                "shadow": shadow_val,
+                "improvement": self.calculate_improvement(
+                    prod_val if prod_val is not None else 0.0,
+                    shadow_val if shadow_val is not None else 0.0,
+                    higher_is_better=higher_is_better,
+                ),
+            }
+
+        comparable_metrics = [
+            values
+            for values in results.values()
+            if values.get("production") is not None
+            and values.get("shadow") is not None
+            and pd.notna(values.get("production"))
+            and pd.notna(values.get("shadow"))
+            and math.isfinite(values.get("production"))
+            and math.isfinite(values.get("shadow"))
+        ]
+
+        if not comparable_metrics:
+            has_shadow_data = any(
+                values.get("shadow") is not None
+                and pd.notna(values.get("shadow"))
+                and math.isfinite(values.get("shadow"))
+                for values in results.values()
+            )
+            if has_shadow_data:
+                # Shadow metrics exist but none are comparable to production —
+                # report a non-comparable evaluation rather than an error so
+                # rollback handling can distinguish it from missing data.
+                return {
+                    "test_id": test_id,
+                    "results": results,
+                    "shadow_better": False,
+                    "should_rollback": False,
+                    "has_comparison": False,
+                    "timestamp": datetime.now(timezone.utc)
+                    .replace(tzinfo=None)
+                    .isoformat(),
+                }
+            return {
+                "test_id": test_id,
+                "results": results,
+                "shadow_better": False,
+                "should_rollback": False,
+                "error": "Insufficient metrics for production vs shadow comparison",
+                "timestamp": datetime.now(timezone.utc)
+                .replace(tzinfo=None)
+                .isoformat(),
+            }
+
+        is_better = self.is_shadow_better(results)
+
+        has_comparison = len(comparable_metrics) > 0
+
+        return {
+            "test_id": test_id,
+            "results": results,
+            "shadow_better": is_better,
+            "should_rollback": has_comparison and not is_better,
+            "has_comparison": has_comparison,
+            "timestamp": datetime.now(timezone.utc)
+            .replace(tzinfo=None)
+            .isoformat(),
+        }
+
     def calculate_improvement(
         self, prod_value: float, shadow_value: float, higher_is_better: bool = True
     ) -> float:
-        """Calculate percentage improvement taking metric direction into account and handling zero prod_value."""
+        """Calculate percentage improvement taking metric direction into account."""
         if prod_value == 0:
             if shadow_value == 0:
                 return 0.0
@@ -152,19 +247,29 @@ class ABTestModel:
         pct = (diff / abs(prod_value)) * 100.0
         return pct if higher_is_better else -pct
 
-    
-    
-    def is_shadow_better(self, results: Dict) -> bool:
+    def is_shadow_better(self, results: dict) -> bool:
         """Determine if shadow model outperforms production based on metric direction and threshold."""
         better_count = 0
         total_metrics = 0
-
-        lower_is_better_keywords = {'rmse', 'mae', 'mse', 'loss', 'error_rate', 'latency', 'error'}
+        lower_is_better_keywords = {
+            "rmse",
+            "mae",
+            "mse",
+            "loss",
+            "error_rate",
+            "latency",
+            "error",
+        }
 
         for metric, values in results.items():
-            prod = values.get('production')
-            shadow = values.get('shadow')
-            if prod is None or shadow is None:
+            prod = values.get("production")
+            shadow = values.get("shadow")
+            if (
+                prod is None
+                or shadow is None
+                or not pd.notna(prod)
+                or not pd.notna(shadow)
+            ):
                 continue
 
             total_metrics += 1
@@ -180,54 +285,22 @@ class ABTestModel:
 
         return better_count > (total_metrics / 2) if total_metrics > 0 else False
 
-    
-    
-    def get_active_test(self) -> Optional[Dict]:
-        """Get currently active A/B test from database"""
-        session = self.Session()
-        try:
-            recent = session.query(ABTestMetrics).filter(
-                ABTestMetrics.timestamp <= datetime.utcnow()
-            ).order_by(ABTestMetrics.timestamp.desc()).first()
-
-            if recent:
-                return {
-                    'test_id': recent.test_id,
-                    'production_version': 'production',
-                    'shadow_version': recent.model_version,
-                    'started_at': recent.timestamp.isoformat(),
-                    'status': 'active'
-                }
-            return None
-        except Exception:
-            return None
-        finally:
-            session.close()
+    def get_active_test(self) -> dict | None:
+        """Only durable, active, paired experiments are eligible for routing."""
+        return self.ledger.active()
 
     def get_production_version(self) -> str:
-        return 'production'
-    
-    def trigger_rollback(self, test_id: str) -> Dict[str, Any]:
-        """Auto-rollback to previous version if shadow model underperforms"""
-        evaluation = self.evaluate_test(test_id)
-        
-        if evaluation.get('should_rollback', False):
-            # Trigger rollback via n8n webhook
-            logger.warning(f"⚠️ Rollback triggered for test {test_id}")
-            
-            # Return rollback instructions
-            return {
-                'action': 'rollback',
-                'test_id': test_id,
-                'reason': 'Shadow model underperformed',
-                'production_version': 'production',
-                'previous_version': 'production',
-                'timestamp': datetime.utcnow().isoformat()
-            }
-        
-        return {
-            'action': 'promote',
-            'test_id': test_id,
-            'reason': 'Shadow model performed well',
-            'timestamp': datetime.utcnow().isoformat()
-        }
+        return get_active_generation(DEMAND_MODEL_NAME) or "production"
+
+    def mark_test_terminal(self, test_id: str, status: str) -> dict:
+        """Terminal status is authoritative and cannot be reopened by late metrics."""
+        return self.ledger.terminal(test_id, status)
+
+    def trigger_rollback(self, test_id: str) -> dict[str, Any]:
+        """Own native experiment/model rollback and its publication receipt."""
+        from services.ab_rollback import rollback_experiment
+
+        result = rollback_experiment(self, test_id, DEMAND_MODEL_NAME)
+        if result.get("rolled_back"):
+            reset_model_cache()
+        return result

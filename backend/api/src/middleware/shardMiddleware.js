@@ -29,6 +29,11 @@ export const shardMiddleware = async (req, res, next) => {
     const rawLng = firstDefined(req.query.lng, req.body?.lng);
 
     if (rawLat !== undefined && rawLat !== null || rawLng !== undefined && rawLng !== null) {
+      if (rawLat === undefined || rawLng === undefined) {
+        return res.status(400).json({
+          error: 'lat and lng are both required when routing by location'
+        });
+      }
       const parsedLat = parseCoordinate(rawLat);
       const parsedLng = parseCoordinate(rawLng);
 
@@ -82,8 +87,10 @@ export const shardMiddleware = async (req, res, next) => {
 };
 
 export const crossShardQuery = async (req, res, next) => {
-  req.executeCrossShard = async (query, params) => {
-    return await shardManager.executeCrossShardQuery({ query, params });
+  req.executeCrossShard = async (query, params, options) => {
+    return options !== undefined
+      ? await shardManager.executeCrossShardQuery({ query, params }, options)
+      : await shardManager.executeCrossShardQuery({ query, params });
   };
   next();
 };

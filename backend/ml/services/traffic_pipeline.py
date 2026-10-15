@@ -2,6 +2,7 @@ import requests
 import json
 import asyncio
 import aiohttp
+import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import numpy as np
@@ -17,16 +18,26 @@ try:
 except ImportError:
     tf = None
     keras = None
+    layers = None
     models = None
     HAS_TF = False
 import redis
 import os
+import tempfile
 import logging
+from math import isfinite
 from functools import partial
-from collections import deque, defaultdict
+from collections import OrderedDict
+from ._eta_observations import observation_lock, prepare_window, finite_prediction
+from app.execution import is_training_cancelled, TrainingCancelled
+from services.recovery_circuit import RecoveryCircuit
 
 logger = logging.getLogger(__name__)
 Base = declarative_base()
+
+DEFAULT_TRAFFIC_SPEED = 50.0
+DEFAULT_FREE_FLOW_SPEED = 80.0
+DEFAULT_CONGESTION_LEVEL = 0.3
 
 
 def eta_seconds_from_speed(route_distance_m: float, predicted_speed_mps: float) -> Optional[float]:
@@ -34,14 +45,15 @@ def eta_seconds_from_speed(route_distance_m: float, predicted_speed_mps: float) 
 
     The LSTM is trained on traffic_speed (m/s) (see train_model), so its raw
     output is a speed, not a duration. eta_seconds = distance_m / speed_mps.
-    Returns None when either input is missing or non-positive so callers can
+    Returns None when either input or the result is invalid so callers can
     fall back to the routing engine's own duration estimate.
     """
-    if not route_distance_m or route_distance_m <= 0:
+    if not route_distance_m or not isfinite(route_distance_m) or route_distance_m <= 0:
         return None
-    if not predicted_speed_mps or predicted_speed_mps <= 0:
+    if not predicted_speed_mps or not isfinite(predicted_speed_mps) or predicted_speed_mps <= 0:
         return None
-    return route_distance_m / predicted_speed_mps
+    eta_seconds = route_distance_m / predicted_speed_mps
+    return eta_seconds if isfinite(eta_seconds) and eta_seconds > 0 else None
 
 class TrafficData(Base):
     __tablename__ = 'traffic_data'
@@ -60,6 +72,8 @@ class TrafficData(Base):
     hour = Column(Integer)
 
 class TrafficPipeline:
+    MAX_ROUTE_WINDOWS = 1000
+
     def __init__(self, db_url: str, redis_url: str):
         self.engine = create_engine(db_url)
         Base.metadata.create_all(self.engine)
@@ -68,11 +82,36 @@ class TrafficPipeline:
         self.model = self._load_or_create_model()
         self.gmaps_api_key = os.getenv('GOOGLE_MAPS_API_KEY', '')
         self.osrm_url = os.getenv('OSRM_URL', 'http://localhost:5000')
+        self.traffic_connect_timeout = float(
+            os.getenv('TRAFFIC_CONNECT_TIMEOUT', '2')
+        )
+        self.traffic_total_timeout = float(
+            os.getenv('TRAFFIC_TOTAL_TIMEOUT', '5')
+        )
         self._closed = False
         # Rolling per-route history of recent feature rows, fed to predict_eta
         # as a genuine 60-step sequence instead of a tiled constant row
         # (issue #11666).
-        self._route_windows = defaultdict(lambda: deque(maxlen=60))
+        self._route_windows = OrderedDict()
+        self._max_route_windows = self.MAX_ROUTE_WINDOWS
+        self._last_route_history_metrics = {
+            'route_id': None,
+            'route_signature': None,
+            'route_key': None,
+        }
+        self._osrm_failure_count = 0
+        self._osrm_circuit_open = False
+
+    @staticmethod
+    def build_route_signature(destination: Dict) -> str:
+        """Build a stable route version from the authoritative destination."""
+        payload = f"{float(destination['lat']):.7f},{float(destination['lng']):.7f}"
+        return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
+
+    def get_route_history_metrics(self) -> Dict[str, Optional[str]]:
+        """Return the route identity used for the most recent prediction."""
+        with observation_lock(self):
+            return dict(self._last_route_history_metrics)
 
     def close(self):
         """Dispose DB connection pool and close Redis connection.
@@ -106,7 +145,11 @@ class TrafficPipeline:
             pass
         
     def _load_or_create_model(self):
-        """Load existing LSTM model or create new"""
+        """Load existing LSTM model or create new, when TensorFlow is available."""
+        if not HAS_TF:
+            logger.warning("TensorFlow is unavailable; ETA model features are disabled")
+            return None
+
         model_path = 'models/eta_lstm.h5'
         if os.path.exists(model_path):
             logger.info("Loading existing LSTM model")
@@ -116,7 +159,10 @@ class TrafficPipeline:
             return self._create_lstm_model()
 
     def _create_lstm_model(self):
-        """Create LSTM model for ETA prediction"""
+        """Create LSTM model for ETA prediction."""
+        if not HAS_TF:
+            return None
+
         model = models.Sequential([
             layers.LSTM(64, input_shape=(60, 5), return_sequences=True),
             layers.Dropout(0.2),
@@ -138,37 +184,69 @@ class TrafficPipeline:
     async def ingest_traffic_data(self, route_id: str, source: Dict, dest: Dict):
         """Ingest real-time traffic data from multiple sources"""
         try:
-            # Get data from Google Maps
             gmaps_data = await self._fetch_gmaps_traffic(source, dest)
-            
-            # Get data from OSRM
             osrm_data = await self._fetch_osrm_data(source, dest)
-            
-            # Combine and store
+
+            observed_at = datetime.utcnow()
+            traffic_speed = gmaps_data.get('speed')
+            if traffic_speed is None:
+                traffic_speed = osrm_data.get('speed', DEFAULT_TRAFFIC_SPEED)
+            free_flow_speed = osrm_data.get(
+                'free_flow_speed',
+                DEFAULT_FREE_FLOW_SPEED
+            )
+            congestion_level = gmaps_data.get(
+                'congestion',
+                DEFAULT_CONGESTION_LEVEL
+            )
+
+            gmaps_complete = (
+                gmaps_data.get('duration') is not None
+                and gmaps_data.get('duration') > 0
+                and gmaps_data.get('speed') is not None
+                and gmaps_data.get('congestion') is not None
+            )
+            osrm_complete = (
+                osrm_data.get('duration') is not None
+                and osrm_data.get('duration') > 0
+                and osrm_data.get('distance') is not None
+                and osrm_data.get('distance') > 0
+                and osrm_data.get('speed') is not None
+                and osrm_data.get('free_flow_speed') is not None
+            )
+            is_degraded = not (gmaps_complete and osrm_complete)
+
             traffic_entry = TrafficData(
                 route_id=route_id,
                 source_lat=source['lat'],
                 source_lng=source['lng'],
                 dest_lat=dest['lat'],
                 dest_lng=dest['lng'],
-                traffic_speed=gmaps_data.get('speed', osrm_data.get('speed', 50)),
-                free_flow_speed=osrm_data.get('free_flow_speed', 80),
-                congestion_level=gmaps_data.get('congestion', 0.3),
-                day_of_week=datetime.now().weekday(),
-                hour=datetime.now().hour
+                traffic_speed=traffic_speed,
+                free_flow_speed=free_flow_speed,
+                congestion_level=congestion_level,
+                timestamp=observed_at,
+                day_of_week=observed_at.weekday(),
+                hour=observed_at.hour
             )
-            
-            session = self.Session()
-            try:
-                session.add(traffic_entry)
-                session.commit()
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
-            
-            # Cache in Redis
+
+            if not is_degraded:
+                session = self.Session()
+                try:
+                    session.add(traffic_entry)
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    raise
+                finally:
+                    session.close()
+            else:
+                logger.warning(
+                    "Traffic ingestion degraded for route %s; "
+                    "fallback values will not be stored for training",
+                    route_id,
+                )
+
             await asyncio.get_running_loop().run_in_executor(
                 None, partial(self.redis.setex,
                     f"traffic:{route_id}",
@@ -176,12 +254,12 @@ class TrafficPipeline:
                     json.dumps({
                         'speed': traffic_entry.traffic_speed,
                         'congestion': traffic_entry.congestion_level,
-                        'timestamp': traffic_entry.timestamp.isoformat()
+                        'timestamp': traffic_entry.timestamp.isoformat(),
+                        'degraded': is_degraded,
                     })
                 )
             )
-            
-            logger.info(f"Traffic data ingested for route {route_id}")
+
             return traffic_entry
             
         except Exception as e:
@@ -189,10 +267,10 @@ class TrafficPipeline:
             return None
     
     async def _fetch_gmaps_traffic(self, source: Dict, dest: Dict):
-        """Fetch traffic data from Google Maps API"""
+        """Fetch traffic data from Google Maps API with timeout and fallback."""
         if not self.gmaps_api_key:
             return {}
-            
+
         url = "https://maps.googleapis.com/maps/api/directions/json"
         params = {
             'origin': f"{source['lat']},{source['lng']}",
@@ -201,39 +279,129 @@ class TrafficPipeline:
             'traffic_model': 'best_guess',
             'key': self.gmaps_api_key
         }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
-                data = await response.json()
-                if data.get('routes'):
-                    route = data['routes'][0]['legs'][0]
-                    duration = route.get('duration_in_traffic', {}).get('value', 0)
-                    normal_duration = route.get('duration', {}).get('value', 1)
-                    
-                    return {
-                        'duration': duration,
-                        'speed': route.get('distance', {}).get('value', 0) / duration if duration > 0 else 50,
-                        'congestion': (duration / normal_duration - 1.0) if normal_duration > 0 else 0
-                    }
+
+        timeout = aiohttp.ClientTimeout(
+        connect=self.traffic_connect_timeout,
+        total=self.traffic_total_timeout,
+        )
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, params=params) as response:
+                    data = await response.json()
+
+                    if data.get('routes'):
+                        route = data['routes'][0]['legs'][0]
+                        duration = route.get(
+                            'duration_in_traffic', {}
+                        ).get('value', 0)
+                        normal_duration = route.get(
+                            'duration', {}
+                        ).get('value', 1)
+
+                        return {
+                            'duration': duration,
+                            'speed': (
+                                route.get('distance', {}).get('value', 0) / duration
+                                if duration > 0
+                                else 50
+                            ),
+                            'congestion': (
+                                duration / normal_duration - 1.0
+                                if normal_duration > 0
+                                else 0
+                            )
+                        }
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError):
+            pass
+
         return {}
     
+    def _get_osrm_circuit(self):
+        # Lazy creation also supports lightweight callers that do not create
+        # database/model resources just to fetch routing data.
+        if not hasattr(self, '_osrm_circuit'):
+            self._osrm_circuit = RecoveryCircuit(
+                failure_threshold=int(os.getenv('OSRM_CIRCUIT_THRESHOLD', '5')),
+                recovery_seconds=float(os.getenv('OSRM_CIRCUIT_RECOVERY_SECONDS', '30')),
+            )
+            self._osrm_circuit.failures = self._osrm_failure_count
+        return self._osrm_circuit
+
+    def get_osrm_health(self):
+        """Local availability state; never performs a paid/live provider call."""
+        return self._get_osrm_circuit().snapshot()
+
     async def _fetch_osrm_data(self, source: Dict, dest: Dict):
-        """Fetch routing data from OSRM"""
-        url = f"{self.osrm_url}/route/v1/driving/{source['lng']},{source['lat']};{dest['lng']},{dest['lat']}"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                data = await response.json()
-                if data.get('routes'):
-                    route = data['routes'][0]
-                    return {
-                        'duration': route['duration'],
-                        'distance': route['distance'],
-                        'speed': route['distance'] / route['duration'] if route['duration'] > 0 else 50,
-                        'free_flow_speed': route['distance'] / (route['duration'] * 0.8) if route['duration'] > 0 else 80
-                    }
-        return {'speed': 50, 'free_flow_speed': 80}
-    
+        """Bounded retries with recoverable admission and degraded fallback."""
+        fallback = {
+            'speed': DEFAULT_TRAFFIC_SPEED,
+            'free_flow_speed': DEFAULT_FREE_FLOW_SPEED,
+        }
+        circuit = self._get_osrm_circuit()
+        admission = circuit.admit()
+        if admission is None:
+            return fallback
+
+        # A half-open probe makes one HTTP request, not a new retry storm.
+        max_attempts = 1 if admission.probe else 3
+        finished = False
+        try:
+            url = (
+                f"{self.osrm_url}/route/v1/driving/"
+                f"{source['lng']},{source['lat']};"
+                f"{dest['lng']},{dest['lat']}"
+            )
+            timeout = aiohttp.ClientTimeout(
+                connect=self.traffic_connect_timeout,
+                total=self.traffic_total_timeout,
+            )
+            for attempt in range(max_attempts):
+                if not circuit.is_current(admission):
+                    return fallback
+                try:
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.get(url) as response:
+                            response.raise_for_status()
+                            data = await response.json()
+                            if data.get('routes'):
+                                route = data['routes'][0]
+                                result = {
+                                    'duration': route['duration'],
+                                    'distance': route['distance'],
+                                    'speed': (
+                                        route['distance'] / route['duration']
+                                        if route['duration'] > 0 else DEFAULT_TRAFFIC_SPEED
+                                    ),
+                                    'free_flow_speed': (
+                                        route['distance'] / (route['duration'] * 0.8)
+                                        if route['duration'] > 0 else DEFAULT_FREE_FLOW_SPEED
+                                    ),
+                                }
+                                circuit.finish(admission, succeeded=True)
+                                finished = True
+                                return result
+                            # NoRoute is a valid OSRM response, not an outage.
+                            if data.get('code') == 'NoRoute':
+                                circuit.finish(admission, succeeded=True)
+                                finished = True
+                                return fallback
+                            raise ValueError('OSRM response has no usable route')
+                except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError,
+                        ValueError, KeyError, TypeError, IndexError):
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(2 ** attempt)
+            circuit.finish(admission, succeeded=False)
+            finished = True
+            logger.warning('OSRM request exhausted attempts; circuit state=%s', circuit.state)
+            return fallback
+        finally:
+            if not finished:
+                circuit.cancel(admission)
+            # Preserve existing diagnostics; the circuit owns admission state.
+            self._osrm_failure_count = circuit.failures
+            self._osrm_circuit_open = circuit.state != 'closed'
+
     async def get_real_time_traffic(self, route_id: str):
         """Get real-time traffic data for a route"""
         cached = await asyncio.get_running_loop().run_in_executor(None, partial(self.redis.get, f"traffic:{route_id}"))
@@ -241,40 +409,53 @@ class TrafficPipeline:
             return json.loads(cached)
         return None
     
-    def predict_eta(self, route_data: np.ndarray, route_id: Optional[str] = None) -> float:
-        """Predict ETA using LSTM model.
-
-        Feeds a genuine rolling window of the last 60 observations for the
-        route (padded at the front by repeating the earliest observation during
-        warm-up) instead of tiling a single row into a constant sequence, which
-        was out of distribution for the model trained on diverse consecutive
-        speeds (issue #11666).
-        """
-        try:
-            if route_data.ndim == 1:
-                route_data = route_data.reshape(1, -1)
-            if route_data.shape[1] != 5:
-                logger.error(f"Prediction failed: expected 5 features, got {route_data.shape[1]}")
+    def predict_eta(
+        self,
+        route_data: np.ndarray,
+        route_id: Optional[str] = None,
+        route_signature: Optional[str] = None,
+    ) -> float:
+        """Predict ETA using an order-specific rolling history."""
+        with observation_lock(self):
+            try:
+                model = self.model
+                if model is None:
+                    logger.warning("ETA prediction unavailable because TensorFlow model is not loaded")
+                    return None
+                base_route_key = route_id or ""
+                route_key = (
+                    f"{base_route_key}:{route_signature}"
+                    if route_signature
+                    else base_route_key
+                )
+                window, model_input = prepare_window(
+                    route_data, self._route_windows.get(route_key)
+                )
+                metrics = {
+                    'route_id': base_route_key or None,
+                    'route_signature': route_signature,
+                    'route_key': route_key,
+                }
+                prediction = finite_prediction(model.predict(model_input, verbose=0))
+                # A failed inference never admits a row, evicts another route or
+                # changes metrics. All outward preparation precedes this commit.
+                if (route_key not in self._route_windows
+                        and len(self._route_windows) >= self._max_route_windows):
+                    self._route_windows.popitem(last=False)
+                self._route_windows[route_key] = window
+                self._route_windows.move_to_end(route_key)
+                self._last_route_history_metrics = metrics
+                return prediction
+            except Exception as e:
+                logger.error(f"Prediction failed: {e}")
                 return None
 
-            window = self._route_windows[route_id or ""]
-            window.append(route_data[0])
-
-            seq = list(window)
-            if len(seq) < 60:
-                # Cold start: pad the front with the earliest observation so
-                # the model still receives a 60-step input.
-                seq = [seq[0]] * (60 - len(seq)) + seq
-
-            model_input = np.array(seq).reshape(1, 60, 5)
-            prediction = self.model.predict(model_input, verbose=0)
-            return float(prediction[0][0])
-        except Exception as e:
-            logger.error(f"Prediction failed: {e}")
-            return None
-    
     def train_model(self, epochs=50, batch_size=32):
         """Train LSTM model on historical data"""
+        if self.model is None:
+            logger.warning("ETA training unavailable because TensorFlow is not installed")
+            return
+
         session = self.Session()
         try:
             data = session.query(TrafficData).all()
@@ -314,21 +495,69 @@ class TrafficPipeline:
             logger.warning("Not enough per-route data for training")
             return
 
-        X = np.concatenate(X_parts, axis=0)
-        y = np.concatenate(y_parts, axis=0)
+        X_train_parts, y_train_parts = [], []
+        X_val_parts, y_val_parts = [], []
+        validation_fraction = 0.2
+
+        for X_route, y_route in zip(X_parts, y_parts):
+            if len(X_route) < 2:
+                continue
+
+            validation_count = max(1, int(np.ceil(len(X_route) * validation_fraction)))
+            split_index = len(X_route) - validation_count
+            if split_index < 1:
+                continue
+
+            X_train_parts.append(X_route[:split_index])
+            y_train_parts.append(y_route[:split_index])
+            X_val_parts.append(X_route[split_index:])
+            y_val_parts.append(y_route[split_index:])
+
+        if not X_train_parts or not X_val_parts:
+            logger.warning("Not enough per-route data for deterministic validation")
+            return
+
+        X_train = np.concatenate(X_train_parts, axis=0)
+        y_train = np.concatenate(y_train_parts, axis=0)
+        X_val = np.concatenate(X_val_parts, axis=0)
+        y_val = np.concatenate(y_val_parts, axis=0)
         
-        # Train
-        self.model.fit(
-            X, y,
+        # Train with an explicit temporal holdout from every eligible route.
+        # This avoids Keras selecting the last 20% of the combined route array,
+        # which can make validation depend on route ordering rather than time.
+        # Train a separate instance so live predictions never observe weights
+        # being mutated by fit(). Publish it only after saving succeeds.
+        candidate = self._create_lstm_model()
+        candidate.set_weights(self.model.get_weights())
+        candidate.fit(
+            X_train,
+            y_train,
             epochs=epochs,
             batch_size=batch_size,
-            validation_split=0.2,
+            validation_data=(X_val, y_val),
             verbose=1
         )
         
-        # Save model
-        os.makedirs(os.path.dirname('models/eta_lstm.h5'), exist_ok=True)
-        self.model.save('models/eta_lstm.h5')
+        if is_training_cancelled():
+            raise TrainingCancelled()
+
+        model_path = 'models/eta_lstm.h5'
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(
+            prefix='.eta-lstm-', suffix='.h5', dir=os.path.dirname(model_path)
+        )
+        os.close(fd)
+        try:
+            candidate.save(temporary_path)
+            if is_training_cancelled():
+                raise TrainingCancelled()
+            # The old artifact stays readable until the complete replacement
+            # exists. In-flight predictions retain their old model reference.
+            os.replace(temporary_path, model_path)
+            self.model = candidate
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
         logger.info("Model trained and saved")
     
     def _create_sequences(self, data: pd.DataFrame, target_col: str, seq_length=60):
@@ -365,20 +594,18 @@ class TrafficPipeline:
                 # speed into an ETA in seconds using the route distance so the
                 # value is meaningful as a travel time. The rolling window is
                 # keyed by the order's route id (issue #11666).
+                route_signature = self.build_route_signature(destination)
                 predicted_speed_mps = self.predict_eta(
                     features,
-                    f"order_{order_id}"
+                    f"order_{order_id}",
+                    route_signature
                 )
 
                 if predicted_speed_mps is not None:
                     osrm_data = await self._fetch_osrm_data(current_location, destination)
                     route_distance_m = float(osrm_data.get('distance') or 0)
-                    if route_distance_m > 0 and predicted_speed_mps > 0:
-                        # Distance (m) / speed (m/s) yields seconds. The speed
-                        # is already m/s — do NOT divide by 3.6 as if it were
-                        # km/h, that inflated the ETA by 3.6x.
-                        eta_seconds = route_distance_m / predicted_speed_mps
-                    else:
+                    eta_seconds = eta_seconds_from_speed(route_distance_m, predicted_speed_mps)
+                    if eta_seconds is None:
                         # Fall back to the routing engine's duration estimate.
                         eta_seconds = float(osrm_data.get('duration') or 0)
 
@@ -422,7 +649,7 @@ class TrafficPipeline:
         if traffic:
             return traffic.get('congestion', 0)
         return 0
-    
+
     async def get_traffic_forecast(self, route_id: str, hours: int = 1):
         """Get traffic forecast for next N hours"""
         # Get historical data for this route

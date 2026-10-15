@@ -499,11 +499,12 @@ func pruneGeofenceRateEntries() {
 		}
 		e.stamps = kept
 		if len(e.stamps) == 0 {
-			// Delete under the entry lock: a concurrent allowGeofence that
-			// re-locks the entry between the emptiness check and the removal
-			// would otherwise lose its timestamps when the entry is deleted,
-			// resetting that driver's 1-second window and allowing bursts
-			// above the cap.
+			// Delete under the entry lock: only retire the exact entry still
+			// mapped to the driver so a newer entry with its own slot is never disturbed.
+			if cur, ok := geofenceRateLimit.Load(e.driverID); !ok || cur.(*rateEntry) != e {
+				e.mu.Unlock()
+				return true
+			}
 			e.retired = true
 			geofenceRateLimit.Delete(key)
 			atomic.AddUint64(&geofenceRateTracked, ^uint64(0))
@@ -691,6 +692,7 @@ func handlePing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var ping TelemetryPing
+	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 	if err := json.NewDecoder(r.Body).Decode(&ping); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid telemetry payload: %v", err), http.StatusBadRequest)
 		return
@@ -783,7 +785,7 @@ func handleGeofence(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req geofenceRequest
-
+	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return

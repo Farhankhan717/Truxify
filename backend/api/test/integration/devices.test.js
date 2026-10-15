@@ -151,7 +151,9 @@ describe('Device Routes Integration Tests', () => {
         .send({ fcmToken: 'token_err_database' });
 
       expect(res.status).toBe(500);
-      expect(res.body.error).toBe('Failed to register device');
+      expect(res.body.error.message).toBe('Failed to register device');
+      expect(res.body.error.code).toBe('INTERNAL_ERROR');
+      expect(res.body.error.details).toEqual({});
     });
 
     it('returns 500 when the transactional device registration fails', async () => {
@@ -163,7 +165,9 @@ describe('Device Routes Integration Tests', () => {
         .send({ fcmToken: 'token_profile_sync_fail', platform: 'android' });
 
       expect(res.status).toBe(500);
-      expect(res.body.error).toBe('Failed to register device');
+      expect(res.body.error.message).toBe('Failed to register device');
+      expect(res.body.error.code).toBe('INTERNAL_ERROR');
+      expect(res.body.error.details).toEqual({});
       // The whole registration (device row + profile sync) is one transaction,
       // so a failure must not leave a partially-inserted device row behind.
       expect(m.store.user_devices.find(d => d.fcm_token === 'token_profile_sync_fail')).toBeUndefined();
@@ -339,11 +343,20 @@ describe('Device Routes Integration Tests', () => {
     });
 
     it('does not remove another user\'s device record for the same token', async () => {
-      m.store.user_devices.push({
-        user_id: 'other-user-uuid',
-        fcm_token: 'shared-device-token',
-        platform: 'android',
-      });
+      m.store.user_devices.push(
+        {
+          user_id: 'unregister-test-user-uuid',
+          fcm_token: 'shared-device-token',
+          platform: 'android',
+          is_active: true,
+        },
+        {
+          user_id: 'other-user-uuid',
+          fcm_token: 'shared-device-token',
+          platform: 'android',
+          is_active: true,
+        }
+      );
 
       const res = await request(buildApp())
         .delete('/api/devices/unregister')
@@ -356,6 +369,7 @@ describe('Device Routes Integration Tests', () => {
         (d) => d.user_id === 'other-user-uuid' && d.fcm_token === 'shared-device-token'
       );
       expect(stillThere).toBeTruthy();
+      expect(stillThere.is_active).toBe(true);
     });
 
     it('returns 500 if database deletion fails and does not expose internal error details', async () => {
@@ -367,7 +381,9 @@ describe('Device Routes Integration Tests', () => {
         .send({ fcmToken: 'token_err_database' });
 
       expect(res.status).toBe(500);
-      expect(res.body.error).toBe('Failed to unregister device');
+      expect(res.body.error.message).toBe('Failed to unregister device');
+      expect(res.body.error.code).toBe('INTERNAL_ERROR');
+      expect(res.body.error.details).toEqual({});
     });
   });
 
@@ -383,6 +399,7 @@ describe('Device Routes Integration Tests', () => {
         user_id: 'unregister-test-user-uuid',
         fcm_token: 'logout-token-123456',
         platform: 'android',
+        is_active: true,
       });
       m.store.profiles.push({
         id: 'unregister-test-user-uuid',
@@ -404,7 +421,9 @@ describe('Device Routes Integration Tests', () => {
       const remainingDevice = m.store.user_devices.find(
         (d) => d.user_id === 'unregister-test-user-uuid' && d.fcm_token === 'logout-token-123456'
       );
-      expect(remainingDevice).toBeUndefined();
+      expect(remainingDevice).toBeTruthy();
+      expect(remainingDevice.is_active).toBe(false);
+      expect(remainingDevice.deactivated_at).toBeTruthy();
     });
   });
 });

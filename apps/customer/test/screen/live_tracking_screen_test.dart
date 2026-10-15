@@ -1,9 +1,13 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mocktail/mocktail.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:truxify_shared/truxify_shared.dart' show WsConnectionState;
 import 'package:truxify/controllers/app_controller.dart';
 import 'package:truxify/l10n/app_localizations.dart';
 import 'package:truxify/screens/live_tracking_screen.dart';
@@ -28,6 +32,16 @@ void main() {
   late MockGoTrueClient mockAuth;
   late MockUser mockUser;
 
+  setUpAll(() {
+    registerFallbackValue(MockRealtimeChannel());
+    registerFallbackValue(PostgresChangeEvent.update);
+    registerFallbackValue(PostgresChangeFilter(
+      type: PostgresChangeFilterType.eq,
+      column: 'id',
+      value: '',
+    ));
+  });
+
   setUp(() {
     SharedPreferences.setMockInitialValues({});
     mockOrderService = MockOrderService();
@@ -40,12 +54,34 @@ void main() {
     when(() => mockUser.id).thenReturn('mock-user-id');
     when(() => mockAuth.currentUser).thenReturn(mockUser);
     when(() => mockSupabase.auth).thenReturn(mockAuth);
+    final mockRealtimeChannel = MockRealtimeChannel();
+    when(() => mockRealtimeChannel.onBroadcast(
+          event: any(named: 'event'),
+          callback: any(named: 'callback'),
+        )).thenReturn(mockRealtimeChannel);
+    when(() => mockRealtimeChannel.onPostgresChanges(
+          event: any(named: 'event'),
+          schema: any(named: 'schema'),
+          table: any(named: 'table'),
+          filter: any(named: 'filter'),
+          callback: any(named: 'callback'),
+        )).thenReturn(mockRealtimeChannel);
+    when(() => mockRealtimeChannel.subscribe(any())).thenReturn(mockRealtimeChannel);
+    when(() => mockSupabase.channel(any())).thenReturn(mockRealtimeChannel);
+    when(() => mockSupabase.removeChannel(any())).thenAnswer((_) async => '');
+    when(() => mockSupabase.removeAllChannels()).thenAnswer((_) async => <String>[]);
     SupabaseService.mockClient = mockSupabase;
 
     // Stub WebSocket
     when(() => mockSocket.connect()).thenAnswer((_) async {});
+    // mocktail's unstubbed bool-returning send() returns null, which throws
+    // a Null→bool type error inside the message handler.
+    when(() => mockSocket.send(any())).thenReturn(true);
     when(() => mockSocket.close()).thenAnswer((_) async {});
     when(() => mockSocket.stream).thenAnswer((_) => const Stream.empty());
+    // The screen subscribes to connectionState for reconnect detection.
+    when(() => mockSocket.connectionState)
+        .thenAnswer((_) => const Stream<WsConnectionState>.empty());
 
     // Stub order service calls
     when(() => mockOrderService.fetchOrderById(any())).thenAnswer((_) async => {
@@ -68,8 +104,8 @@ void main() {
 
     when(() => mockOrderService.fetchOrderTimeline(any())).thenAnswer((_) async => [
       {
-        'status': 'Booked',
-        'timestamp': '2026-08-03T00:00:00Z',
+        'milestone': 'Booking Confirmed',
+        'milestone_time': '2026-08-03T00:00:00Z',
         'completed': true,
       }
     ]);
@@ -122,11 +158,20 @@ void main() {
     );
   }
 
+
+/// The screen's live indicator animates forever, so pumpAndSettle never
+/// settles (see #17587). Bounded pumps flush async work + transitions.
+Future<void> boundedSettle(WidgetTester tester) async {
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 500));
+  await tester.pump();
+}
+
   group('LiveTrackingScreen Widget Tests', () {
     testWidgets('mounts the map widget and initiates WebSocket connection on load', (tester) async {
       await tester.pumpWidget(createTestWidget(tester));
       await tester.pump(); // Start data loading
-      await tester.pumpAndSettle(); // Wait for animations & state
+      await boundedSettle(tester); // Wait for animations & state
 
       // Verify the map widget mounts without errors
       expect(find.byType(FlutterMap), findsOneWidget);
@@ -140,9 +185,149 @@ void main() {
       expect(find.textContaining('Calculating…'), findsOneWidget);
 
       await tester.pump();
-      await tester.pumpAndSettle();
+      await boundedSettle(tester);
 
       expect(find.textContaining('45 mins'), findsOneWidget);
+    });
+
+    testWidgets('displays formatted milestone timestamp using milestone_time', (tester) async {
+      await tester.pumpWidget(createTestWidget(tester));
+      await tester.pump();
+      await boundedSettle(tester);
+
+      final dt = DateTime.parse('2026-08-03T00:00:00Z').toLocal();
+      final expectedTimestamp =
+          '${dt.day.toString().padLeft(2, '0')}/${dt.month.toString().padLeft(2, '0')}/${dt.year} ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+
+      expect(find.text(expectedTimestamp), findsWidgets);
+    });
+
+    testWidgets('refreshes authoritative state after reconnect', (tester) async {
+      final messages = StreamController<dynamic>.broadcast();
+      final states = StreamController<WsConnectionState>.broadcast();
+      addTearDown(messages.close);
+      addTearDown(states.close);
+      when(() => mockSocket.stream).thenAnswer((_) => messages.stream);
+      when(() => mockSocket.connectionState).thenAnswer((_) => states.stream);
+
+      var orderFetches = 0;
+      var timelineFetches = 0;
+      var locationFetches = 0;
+      when(() => mockOrderService.fetchOrderById(any())).thenAnswer((_) async {
+        orderFetches++;
+        return {
+          'id': 'order-123',
+          'order_display_id': 'TX1001',
+          'status': orderFetches == 1 ? 'In Transit' : 'Delivered',
+          'updated_at': orderFetches == 1
+              ? '2026-08-03T00:00:00Z'
+              : '2026-08-03T01:00:00Z',
+        };
+      });
+      when(() => mockOrderService.fetchOrderTimeline(any())).thenAnswer((_) async {
+        timelineFetches++;
+        return [
+          {
+            'milestone': timelineFetches == 1 ? 'In Transit' : 'Delivered',
+            'completed': true,
+          },
+        ];
+      });
+      when(() => mockOrderService.fetchDriverLocation(any())).thenAnswer((_) async {
+        locationFetches++;
+        return {
+          'lat': locationFetches == 1 ? 20.0 : 21.0,
+          'lng': 72.85,
+          'timestamp': locationFetches == 1
+              ? '2026-08-03T00:00:00Z'
+              : '2026-08-03T01:00:00Z',
+        };
+      });
+
+      await tester.pumpWidget(createTestWidget(tester));
+      await boundedSettle(tester);
+
+      // First connection's auth frame — no refresh (initial load did it).
+      messages.add(jsonEncode({'status': 'authenticated'}));
+      await tester.pump();
+
+      // Reconnect: the new 'connected' transition resets the per-connection
+      // auth flag, so the next 'authenticated' frame is the reconnect.
+      states.add(WsConnectionState.connected);
+      await tester.pump();
+      messages.add(jsonEncode({'status': 'authenticated'}));
+      await boundedSettle(tester);
+
+      // A duplicate auth frame on the same connection refreshes nothing.
+      messages.add(jsonEncode({'status': 'authenticated'}));
+      await boundedSettle(tester);
+
+      expect(orderFetches, 2);
+      expect(timelineFetches, 2);
+      expect(locationFetches, 2);
+      expect(find.text('Delivered'), findsWidgets);
+    });
+
+    testWidgets('keeps a newer live location over an older reconnect snapshot', (tester) async {
+      final messages = StreamController<dynamic>.broadcast();
+      addTearDown(messages.close);
+      when(() => mockSocket.stream).thenAnswer((_) => messages.stream);
+
+      final states = StreamController<WsConnectionState>.broadcast();
+      addTearDown(states.close);
+      when(() => mockSocket.connectionState).thenAnswer((_) => states.stream);
+
+      final reconnectLocation = Completer<Map<String, dynamic>>();
+      var locationFetches = 0;
+      when(() => mockOrderService.fetchDriverLocation(any())).thenAnswer((_) {
+        locationFetches++;
+        if (locationFetches == 1) {
+          return Future.value({
+            'lat': 20.0,
+            'lng': 72.85,
+            'timestamp': '2026-08-03T00:00:00Z',
+          });
+        }
+        return reconnectLocation.future;
+      });
+
+      await tester.pumpWidget(createTestWidget(tester));
+      await boundedSettle(tester);
+
+      messages.add(jsonEncode({'status': 'authenticated'}));
+      await tester.pump();
+      // Reconnect transition, then the reconnect auth frame.
+      states.add(WsConnectionState.connected);
+      await tester.pump();
+      messages.add(jsonEncode({'status': 'authenticated'}));
+      await tester.pump();
+      messages.add(jsonEncode({
+        'event': 'location_update',
+        'data': {
+          'latitude': 22.0,
+          'longitude': 72.85,
+          'timestamp': '2026-08-03T02:00:00Z',
+        },
+      }));
+      await tester.pump();
+
+      reconnectLocation.complete({
+        'lat': 21.0,
+        'lng': 72.85,
+        'timestamp': '2026-08-03T01:00:00Z',
+      });
+      await boundedSettle(tester);
+
+      verify(() => mockOrderService.fetchMlEta(
+            tripId: 'TX1001',
+            lat: 22.0,
+            lng: 72.85,
+          )).called(1);
+      verifyNever(() => mockOrderService.fetchMlEta(
+            tripId: 'TX1001',
+            lat: 21.0,
+            lng: 72.85,
+          ));
     });
   });
 
@@ -150,7 +335,7 @@ void main() {
     testWidgets('subscribes to Supabase Realtime when order id is an integer', (tester) async {
       final mockChannel = MockRealtimeChannel();
 
-      when(() => mockSupabase.removeChannel(any())).thenAnswer((_) async {});
+      when(() => mockSupabase.removeChannel(any())).thenAnswer((_) async => 'ok');
       when(() => mockChannel.onBroadcast(
             event: any(named: 'event'),
             callback: any(named: 'callback'),
@@ -191,7 +376,7 @@ void main() {
 
       await tester.pumpWidget(createTestWidget(tester));
       await tester.pump();
-      await tester.pumpAndSettle();
+      await boundedSettle(tester);
 
       // The numeric order id must be coerced to a string and the realtime
       // subscription channel must be created. With `as String` this would

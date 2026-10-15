@@ -5,6 +5,42 @@ import { supabase, supabaseAdmin } from '../config/db.js';
 import logger from '../middleware/logger.js';
 
 const DIGILOCKER_TIMEOUT_MS = 10000;
+// Inside backend/api/src/services/digilockerService.js
+
+// --- BEFORE (Incorrect columns & swallowed errors):
+/*
+const { error } = await supabase
+  .from('driver_documents')
+  .upsert({
+    driver_id: driverId,
+    document_type: documentType,
+    document_hash: docHash,           // Phantom column
+    is_verified: isVerified,           // Phantom column
+    verification_source: 'DIGILOCKER' // Phantom column
+  });
+
+return { success: true };
+*/
+
+// --- AFTER (Correct columns & proper error handling):
+const { error } = await supabase
+  .from('driver_documents')
+  .upsert({
+    driver_id: driverId,
+    document_type: documentType,
+    is_govt_verified: isVerified,       // Correct actual column
+    blockchain_tx_hash: blockchainHash   // Correct actual column
+  });
+
+if (error) {
+  console.error('Failed to upsert driver document:', error.message);
+  return { success: false, error: error.message };
+}
+
+return { success: true };
+// Sentinel stored on profiles that have not linked a wallet yet. It is a
+// truthy string, so it must be compared explicitly before any on-chain write.
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
 class DigilockerService {
   constructor() {
@@ -53,7 +89,35 @@ class DigilockerService {
       logger.warn('DocumentRegistry/KYC contract not configured: missing RPC, key, or contract address');
     }
   }
+// backend/api/src/services/digilockerService.js
 
+// Example 1: Token exchange call (approx. line 52 & 168)
+const tokenResponse = await axios.post(
+  'https://api.digitallocker.gov.in/public/oauth2/1/token',
+  params,
+  {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 10000 // 10 second timeout
+  }
+);
+
+// Example 2: Issued files list call (approx. line 207)
+const filesResponse = await axios.get(
+  'https://api.digitallocker.gov.in/public/oauth2/1/files/issued',
+  {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    timeout: 10000
+  }
+);
+
+// Example 3: Individual file download/verification call (approx. line 214)
+const fileResponse = await axios.get(
+  `https://api.digitallocker.gov.in/public/oauth2/1/file/${fileUri}`,
+  {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    timeout: 10000
+  }
+);
   /**
    * Returns true when every configured contract is deployed at its configured
    * address and answers an ABI probe, so a typo'd or cross-contract address is
@@ -118,7 +182,7 @@ class DigilockerService {
         };
       } catch (err) {
         logger.error({ err }, '[DigilockerService] OAuth exchange failed');
-        return { success: false, error: err.message };
+        return { success: false, error: (err?.message ?? String(err)) };
       }
     }
 
@@ -140,6 +204,8 @@ class DigilockerService {
       return { success: false, error: 'DigiLocker verification is not configured', is_digilocker_verified: false };
     }
     logger.info(`[DigilockerService] Verifying documents for user ${userId} with token ${accessToken}`);
+
+
 
     const dlData = {
       doc_type: 'driving_licence',
@@ -185,7 +251,7 @@ class DigilockerService {
         logger.info(`[DigilockerService] Smart contract write succeeded. TX hash: ${tx.hash}`);
       } catch (err) {
         logger.error({ err }, '[DigilockerService] Smart contract write failed');
-        throw new Error(`On-chain document hash write failed: ${err.message}`, { cause: err });
+        throw new Error(`On-chain document hash write failed: ${(err?.message ?? String(err))}`, { cause: err });
       }
     } else {
       logger.info(`[DigilockerService] KYC verifier contract address/private key not set. Mocking on-chain hash submission.`);
@@ -236,7 +302,7 @@ class DigilockerService {
         tokenData = tokenResponse.data;
       } catch (err) {
         logger.error({ err }, 'Digilocker token exchange failed');
-        throw new Error('Digilocker token exchange failed: ' + err.message, { cause: err });
+        throw new Error('Digilocker token exchange failed: ' + (err?.message ?? String(err)), { cause: err });
       }
     }
 
@@ -283,7 +349,7 @@ class DigilockerService {
         }
       } catch (err) {
         logger.error({ err }, 'Failed to fetch DigiLocker documents');
-        throw new Error('Failed to fetch DigiLocker documents: ' + err.message, { cause: err });
+        throw new Error('Failed to fetch DigiLocker documents: ' + (err?.message ?? String(err)), { cause: err });
       }
     }
 
@@ -299,12 +365,21 @@ class DigilockerService {
         .maybeSingle();
 
       const walletAddress = profile?.polygon_wallet_address;
-      if (!walletAddress || walletAddress === '0x0000000000000000000000000000000000000000') {
+      // The zero address is the sentinel the code already recognises, but it is
+      // a truthy string, so the old `if (this.documentRegistry && walletAddress)`
+      // guard let it through and submitted a real registerDocument transaction
+      // to 0x0 while the log claimed the write was skipped.
+      const hasUsableWallet =
+        !!walletAddress &&
+        walletAddress !== ZERO_ADDRESS &&
+        String(walletAddress).trim() !== '';
+
+      if (!hasUsableWallet) {
         logger.warn(`[DigilockerService] Skipping blockchain registration for user ${driverId}: no valid wallet address`);
       }
       let txHash = null;
 
-      if (this.documentRegistry && walletAddress) {
+      if (this.documentRegistry && hasUsableWallet) {
         try {
           const tx = await this.documentRegistry.registerDocument(walletAddress, doc.type, docHash, true);
           await tx.wait();
@@ -387,17 +462,44 @@ class DigilockerService {
         error: syncErrors.join('; '),
         syncedDocumentsCount: syncResults.length,
         documents: syncResults,
-        isMock
+        isMock,
+        is_digilocker_verified: false,
       };
+    }
+
+    if (syncResults.length > 0) {
+      const { error: profileUpdateErr } = await supabaseAdmin
+        .from('profiles')
+        .update({ is_digilocker_verified: true })
+        .eq('id', driverId);
+
+      if (profileUpdateErr) {
+        logger.error(`[DigilockerService] Failed to update profile is_digilocker_verified for ${driverId}:`, profileUpdateErr.message);
+      }
     }
 
     return {
       success: true,
       syncedDocumentsCount: syncResults.length,
       documents: syncResults,
-      isMock
+      isMock,
+      is_digilocker_verified: syncResults.length > 0,
     };
+
   }
 }
+// backend/api/src/services/digilockerService.js
+
+// Example axios configuration update for outbound DigiLocker calls:
+const response = await axios.get('https://api.digitallocker.gov.in/...', {
+  headers: { ... },
+  timeout: 10000 // 10-second timeout guard
+});
+
+// For POST requests:
+const tokenResponse = await axios.post('https://api.digitallocker.gov.in/oauth/token', payload, {
+  headers: { ... },
+  timeout: 10000 // 10-second timeout guard
+});
 
 export default new DigilockerService();

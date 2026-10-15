@@ -1,4 +1,5 @@
 import logger from '../middleware/logger.js';
+import { randomUUID } from 'node:crypto';
 
 /**
  * Service for AR-guided container loading optimization and axle weight balancing.
@@ -15,7 +16,7 @@ class ARLoadingOptimizerService {
    * @param {Array<Object>} params.pallets - [{ id: 'PLT-1', lengthCm: 120, widthCm: 100, heightCm: 150, weightKg: 850, fragile: false }]
    * @returns {Object} AR 3D spatial layout plan and axle weight distribution profile
    */
-  async generateLoadingPlan({ container, pallets }) {
+  async generateLoadingPlan({ ownerId, container, pallets }) {
     if (!container || !Array.isArray(pallets) || pallets.length === 0) {
       throw new Error('Invalid container specs or empty pallets list');
     }
@@ -26,6 +27,17 @@ class ARLoadingOptimizerService {
       heightCm = 280,
       maxPayloadKg = 20000
     } = container;
+
+    const containerValues = [lengthCm, widthCm, heightCm, maxPayloadKg];
+    if (containerValues.some((value) => !Number.isFinite(value) || value <= 0)) {
+      throw new Error('Container dimensions and payload must be positive finite numbers');
+    }
+    if (pallets.some((pallet) => {
+      const values = [pallet.lengthCm, pallet.widthCm, pallet.heightCm, pallet.weightKg];
+      return values.some((value) => value !== undefined && (!Number.isFinite(value) || value <= 0));
+    })) {
+      throw new Error('Pallet dimensions and weight must be positive finite numbers');
+    }
 
     const totalContainerVolume = lengthCm * widthCm * heightCm;
     let totalWeightKg = 0;
@@ -91,9 +103,10 @@ class ARLoadingOptimizerService {
     const frontAxleLoadKg = Math.round(totalWeightKg * 0.42);
     const rearAxleLoadKg = Math.round(totalWeightKg * 0.58);
 
-    const planId = `AR-PLAN-${Date.now()}`;
+    const planId = `PLAN-${randomUUID()}`;
     const plan = {
       planId,
+      ownerId,
       container,
       totalWeightKg,
       maxPayloadKg,
@@ -118,8 +131,12 @@ class ARLoadingOptimizerService {
   /**
    * Retrieves an AR loading plan by ID
    */
-  async getLoadingPlan(planId) {
-    return this.loadingPlans.get(planId) || null;
+  async getLoadingPlan(planId, ownerId) {
+    const plan = this.loadingPlans.get(planId);
+    if (!plan || (ownerId && plan.ownerId && plan.ownerId !== ownerId)) {
+      return null;
+    }
+    return plan;
   }
 }
 

@@ -1,11 +1,15 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { RequestCache, attachResponseCleanup } from '../../src/lib/requestCache.js';
+const mockLogger = vi.hoisted(() => ({
+  error: vi.fn(),
+}));
 
+vi.mock('../../src/middleware/logger.js', () => ({
+  default: mockLogger,
+}));
 describe('RequestCache', () => {
   let cache;
-  beforeEach(() => { cache = new RequestCache(); });
-
   beforeEach(() => {
     cache = new RequestCache();
   });
@@ -58,6 +62,26 @@ describe('RequestCache', () => {
 
   it('set returns this for chaining', () => {
     expect(cache.set('a', 1)).toBe(cache);
+  });
+  it('logs the error when setBatch fails', () => {
+    const error = new Error('cache failure');
+
+    cache.set = vi.fn(() => {
+      throw error;
+    });
+
+    cache.setBatch([{ key: 'test-key', value: 'test-value' }]);
+
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      {
+        event: 'REQUEST_CACHE_SET_ERROR',
+        key: 'test-key',
+        err: error,
+      },
+      '[RequestCache] setBatch failed for key',
+    );
+
+    expect(cache._errorCount).toBe(1);
   });
 });
 

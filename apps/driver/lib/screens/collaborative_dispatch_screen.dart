@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 import '../models/collaborative_dispatch_model.dart';
 import '../services/collaborative_dispatch_service.dart';
 
@@ -128,7 +128,7 @@ class _CollaborativeDispatchScreenState extends State<CollaborativeDispatchScree
         child: ListTile(
           contentPadding: const EdgeInsets.all(16),
           leading: CircleAvatar(
-            backgroundColor: isLocked ? lockColor.withOpacity(0.2) : Colors.blueGrey[50],
+            backgroundColor: isLocked ? lockColor.withValues(alpha: 0.2) : Colors.blueGrey[50],
             child: Icon(isLocked ? Icons.lock : Icons.local_shipping, color: isLocked ? lockColor : Colors.blueGrey),
           ),
           title: Text('${load.origin} ➔ ${load.destination}', style: TextStyle(fontWeight: FontWeight.bold, color: isLocked ? lockColor : Colors.black87)),
@@ -141,7 +141,7 @@ class _CollaborativeDispatchScreenState extends State<CollaborativeDispatchScree
                 const SizedBox(height: 8),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  decoration: BoxDecoration(color: lockColor.withOpacity(0.1), borderRadius: BorderRadius.circular(4)),
+                  decoration: BoxDecoration(color: lockColor.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(4)),
                   child: Text('Editing: ${load.lockedByUserName}', style: TextStyle(color: lockColor, fontSize: 12, fontWeight: FontWeight.bold)),
                 )
               ]
@@ -153,7 +153,12 @@ class _CollaborativeDispatchScreenState extends State<CollaborativeDispatchScree
   }
 
   Widget _buildMockCursor(DispatchCursor c) {
-    Color cursorColor = Color(int.parse(c.colorHex));
+        // Safe color parsing to prevent crashes on untrusted/malformed backend color strings (#14933)
+    final cleanedHex = c.colorHex?.replaceAll('#', '') ?? '';
+    final parsedColorValue = int.tryParse(cleanedHex, radix: 16);
+    final Color cursorColor = parsedColorValue != null 
+        ? Color(parsedColorValue | 0xFF000000) 
+        : Colors.blueGrey;
     
     // Using a tween to make the mock cursor 'float' a bit
     return Positioned(

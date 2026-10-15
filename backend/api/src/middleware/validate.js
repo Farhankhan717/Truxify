@@ -1,5 +1,49 @@
+/**
+ * Validation Middleware
+ * 
+ * Inspects express-validator validation results on incoming requests.
+ * If validation errors exist, logs a structured warning with request tracing 
+ * and field details before returning a 400 Bad Request response.
+ */
+
+import { validationResult } from 'express-validator';
 import logger from './logger.js';
 
+export const validate = (req, res, next) => {
+  const errors = validationResult(req);
+  
+  if (!errors.isEmpty()) {
+    const formattedErrors = errors.array().map((err) => ({
+      field: err.path || err.param || 'unknown',
+      message: err.msg,
+      value: err.value,
+    }));
+
+    const failingFields = formattedErrors.map((err) => err.field);
+
+    logger.warn(
+      {
+        requestId: req.requestId || req.id,
+        event: 'VALIDATION_ERROR',
+        fields: failingFields,
+        errors: formattedErrors,
+        path: req.originalUrl || req.url,
+        method: req.method,
+      },
+      'Request validation failed'
+    );
+
+    return res.status(400).json({
+      success: false,
+      error: 'Validation failed',
+      errors: formattedErrors,
+    });
+  }
+
+  next();
+};
+
+export default validate;
 export function formatValidationIssues(error) {
   return error.issues.map((issue) => ({
     field: issue.path.length > 0 ? issue.path.join(".") : "body",
@@ -37,21 +81,37 @@ export function validateBody(schema) {
       });
     }
 
-    const result = schema.safeParse(req.body);
+    try {
+      const result = schema.safeParse(req.body);
 
-    if (!result.success) {
+      if (!result.success) {
+        logger.warn(
+          { event: 'VALIDATION_ERROR', type: 'body', requestId: req.requestId || req.id, details: formatValidationIssues(result.error) },
+          'Body validation failed',
+        );
+        return res.status(400).json({
+          error: "Validation failed",
+          details: formatValidationIssues(result.error),
+        });
+      }
+
+      req.body = result.data;
+      return next();
+    } catch (err) {
       logger.warn(
-        { event: 'VALIDATION_ERROR', type: 'body', requestId: req.requestId || req.id, details: formatValidationIssues(result.error) },
-        'Body validation failed',
+        {
+          event: 'VALIDATION_ERROR',
+          type: 'body',
+          requestId: req.requestId || req.id,
+          error: err.message,
+        },
+        'Body validation threw',
       );
       return res.status(400).json({
         error: "Validation failed",
-        details: formatValidationIssues(result.error),
+        details: [{ field: "body", message: err.message }],
       });
     }
-
-    req.body = result.data;
-    return next();
   };
 }
 
@@ -64,21 +124,37 @@ export function validateParams(schema) {
       });
     }
 
-    const result = schema.safeParse(req.params);
+    try {
+      const result = schema.safeParse(req.params);
 
-    if (!result.success) {
+      if (!result.success) {
+        logger.warn(
+          { event: 'VALIDATION_ERROR', type: 'params', requestId: req.requestId || req.id, details: formatValidationIssues(result.error) },
+          'Params validation failed',
+        );
+        return res.status(400).json({
+          error: "Validation failed",
+          details: formatValidationIssues(result.error),
+        });
+      }
+
+      req.params = result.data;
+      return next();
+    } catch (err) {
       logger.warn(
-        { event: 'VALIDATION_ERROR', type: 'params', requestId: req.requestId || req.id, details: formatValidationIssues(result.error) },
-        'Params validation failed',
+        {
+          event: 'VALIDATION_ERROR',
+          type: 'params',
+          requestId: req.requestId || req.id,
+          error: err.message,
+        },
+        'Params validation threw',
       );
       return res.status(400).json({
         error: "Validation failed",
-        details: formatValidationIssues(result.error),
+        details: [{ field: "params", message: err.message }],
       });
     }
-
-    req.params = result.data;
-    return next();
   };
 }
 
@@ -126,3 +202,4 @@ export function validateQuery(schema) {
     }
   };
 }
+

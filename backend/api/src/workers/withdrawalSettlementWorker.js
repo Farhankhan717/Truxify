@@ -5,11 +5,13 @@ import {
   isPayoutProviderConfigured,
   recoverSettlementRef,
 } from "../services/wallet/payoutProvider.js";
+import { sendPushNotification } from "../services/notificationService.js";
 import { WorkerTracer } from "../core/telemetry/WorkerTracer.js";
 
 const BATCH_LIMIT = 50;
 const SETTLE_RETRY_ATTEMPTS = 3;
 const SETTLE_RETRY_DELAYS_MS = [500, 1500, 3000];
+const DEFAULT_MAX_RETRIES = 5;
 
 // Persisting the settlement_ref is what guarantees a dispatched payout is
 // never orphaned, so we retry harder (and longer) than the settle RPC itself.
@@ -25,20 +27,66 @@ let intervalId = null;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * Calculates exponential backoff delay in seconds with a 1-hour cap.
+ * Attempt 0 -> 60s (1m)
+ * Attempt 1 -> 120s (2m)
+ * Attempt 2 -> 240s (4m)
+ * Attempt 3 -> 480s (8m)
+ * Attempt 4 -> 960s (16m)
+ */
+export function calculateBackoffDelaySeconds(retryCount) {
+  const BASE_SECONDS = 60;
+  const MAX_SECONDS = 3600;
+  return Math.min(BASE_SECONDS * Math.pow(2, Math.max(0, retryCount || 0)), MAX_SECONDS);
+}
+
+/**
  * Classifies a dispatchPayout failure as "ambiguous": the payout may already
  * have been committed at the gateway before the request timed out/errored, so
  * it is unsafe to assume nothing left the platform. These errors must NOT lead
  * to restoring reserved funds (which would double-pay the driver).
+ *
+ * The default is deliberately AMBIGUOUS. Restoring funds on an unproven failure
+ * permanently double-credits the driver, whereas treating an unproven outcome as
+ * ambiguous only delays the payout (backoff retry, then DLQ, then manual
+ * reconciliation). Both directions are handled by the same worker, but they are
+ * not symmetric in cost, so we fail toward the recoverable one.
+ *
+ * Consequently this is an allowlist of the only failures we can PROVE never
+ * reached the provider - the argument validations that run before dispatchPayout
+ * calls fetch(). Everything else is treated as ambiguous.
+ *
+ * The previous implementation inverted this and matched on error substrings, which
+ * misclassified three real cases as "safe to refund":
+ *
+ *   1. "Payout webhook did not respond within 10000ms." - the AbortSignal
+ *      timeout. Its message contains none of the ambiguity substrings
+ *      (no "timeout", no "network", no 5xx), so an indeterminate payout was
+ *      refunded, defeating the intent stated at the throw site itself.
+ *   2. "Payout webhook returned HTTP 200 but body contains no settlement_ref" -
+ *      a 2xx is positive evidence the payout was accepted. Failing to read the
+ *      reference out of the body is not evidence the payout failed.
+ *   3. HTTP 408/425/429 and any unrecognised transport/parse error.
  */
-function isAmbiguousDispatchError(err) {
+export function isAmbiguousDispatchError(err) {
   const msg = String((err && err.message) || "").toLowerCase();
-  return (
-    /timeout|timed out|etimedout|econnreset|econnrefused|enotfound|network|socket|eai_again/.test(
-      msg,
-    ) ||
-    /[^0-9]5\d\d\b/.test(msg) ||
-    /unknown error/.test(msg)
-  );
+
+  // Raised before any request leaves the process, so no money can have moved.
+  const PROVED_NOT_DISPATCHED = [
+    /invalid withdrawal amount/,
+    /no withdrawal payout provider configured/,
+    /not supported yet/,
+    // Bank-side permanent rejections: the payout provably never left the
+    // platform, so funds must be restored rather than retried.
+    /invalid bank account/,
+    /insufficient platform balance/,
+    /bank rejected/,
+  ];
+  if (PROVED_NOT_DISPATCHED.some((pattern) => pattern.test(msg))) {
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -48,10 +96,29 @@ function isAmbiguousDispatchError(err) {
  * Returns true only when this caller reserved the row.
  */
 async function claimWithdrawal(withdrawalId) {
+  // This claim is the linearization point before an irreversible payout, so it
+  // must re-assert EVERY precondition that makes a payout correct, not just
+  // that the claim token is free.
+  //
+  // payout_attempted_at alone is insufficient because it is a reusable token:
+  // schedule_withdrawal_retry and admin_resolve_dlq_withdrawal's requeue path
+  // both deliberately reset it to NULL so the next sweep can re-claim. A row can
+  // therefore legitimately be pending-and-unclaimed again while a worker still
+  // holds a stale candidate snapshot, and it can leave 'pending' entirely
+  // between the candidate SELECT and this UPDATE (fail_withdrawal_tx refunds the
+  // wallet and marks the row failed without touching payout_attempted_at).
+  //
+  // Claiming such a row dispatches a real payout that settle_withdrawal_tx then
+  // rejects (it only matches rows still in 'pending'), leaving money paid out on
+  // an already-refunded withdrawal. Re-asserting status/settled_at/txn_type here
+  // makes the claim match exactly the set the candidate SELECT chose from.
   const { data, error } = await supabaseAdmin
     .from("wallet_transactions")
     .update({ payout_attempted_at: new Date().toISOString() })
     .eq("id", withdrawalId)
+    .eq("txn_type", "withdrawal")
+    .eq("status", "pending")
+    .is("settled_at", null)
     .is("payout_attempted_at", null)
     .select("id");
 
@@ -68,12 +135,6 @@ async function claimWithdrawal(withdrawalId) {
  * Records the dispatch outcome on the already-claimed row so a crash between
  * dispatch and the completion RPC is detected and re-settled (not failed) on
  * the next sweep.
- *
- * Persisting `settlement_ref` is what lets the NEXT sweep settle a withdrawal
- * whose payout already left the platform: without it the row stays 'pending'
- * with `payout_attempted_at` set and the refuse-to-settle guard would freeze
- * the driver's funds forever. We therefore retry with backoff on transient
- * errors instead of silently dropping the write.
  */
 async function recordDispatchOutcome(withdrawalId, settlementRef) {
   let lastError = null;
@@ -92,9 +153,6 @@ async function recordDispatchOutcome(withdrawalId, settlementRef) {
       await sleep(RECORD_PERSIST_DELAYS_MS[attempt - 1]);
     }
   }
-  // Even after retries the outcome could not be persisted. The in-memory
-  // settlementRef is still used to settle this sweep, so we surface the error
-  // to the caller rather than silently losing the reference.
   throw new Error(
     `[WithdrawalSettlementWorker] Failed to record dispatch outcome for ${withdrawalId} after ${SETTLE_RETRY_ATTEMPTS} attempts: ${lastError?.message}`,
   );
@@ -105,10 +163,6 @@ async function recordDispatchOutcome(withdrawalId, settlementRef) {
  * settle_withdrawal_tx is idempotent and only matches rows still in 'pending'.
  */
 async function settleWithRetry(withdrawalId, settlementRef) {
-  // settle_withdrawal_tx happily marks a withdrawal 'completed' and releases
-  // the reserved wallet_pending balance even when p_settlement_ref is NULL.
-  // Never settle without an actual payout reference: the row may have been
-  // claimed but the payout never confirmed dispatched (crash window).
   if (!settlementRef) {
     throw new Error(
       `Refusing to settle withdrawal ${withdrawalId}: no payout settlement reference recorded.`,
@@ -135,12 +189,7 @@ async function settleWithRetry(withdrawalId, settlementRef) {
 
 /**
  * Escalates a withdrawal that was claimed (payout_attempted_at set) but is
- * stuck without a settlement_ref and cannot be re-derived from the provider
- * (Issue #14686). The row is NOT restored to wallet_confirmed — the payout may
- * already have left the platform, so restoring would double-pay the driver.
- * Instead we raise a reconciliation/DLQ alert so an operator can confirm the
- * payout status against the provider and manually settle or fail the row.
- * Silently `continue`-ing here is what previously orphaned the driver forever.
+ * stuck without a settlement_ref and cannot be re-derived from the provider.
  */
 async function flagForReconciliation(withdrawalId) {
   logger.error(
@@ -151,20 +200,12 @@ async function flagForReconciliation(withdrawalId) {
 
 /**
  * Settles 'pending' withdrawal wallet_transactions:
- *   1. loads the oldest un-settled pending withdrawals;
- *   2. atomically claims each unclaimed row (payout_attempted_at IS NULL) so
- *      exactly one concurrent sweep dispatches it;
+ *   1. loads pending withdrawals whose next_retry_at <= now();
+ *   2. atomically claims each unclaimed row (payout_attempted_at IS NULL);
  *   3. dispatches the payout through the configured payout provider;
- *   4. marks the withdrawal completed (settle_withdrawal_tx) or failed
- *      (fail_withdrawal_tx) with the reserved funds restored to
- *      wallet_confirmed.
- *
- * Failure-mode split (Issue #6274):
- *   - dispatchPayout failed BEFORE money left the platform -> fail the
- *     withdrawal and restore the reserved funds to wallet_confirmed;
- *   - dispatchPayout succeeded but settle_withdrawal_tx failed -> NEVER
- *     restore funds. The row stays 'pending' with payout_attempted_at set so
- *     the next sweep detects it and retries the (idempotent) settle call.
+ *   4. handles transient failures by scheduling an exponential backoff retry;
+ *   5. transitions to DLQ if max retries are exceeded;
+ *   6. emits driver status notifications on terminal/retry events.
  */
 export async function settlePendingWithdrawals() {
   if (!supabaseAdmin) {
@@ -181,16 +222,19 @@ export async function settlePendingWithdrawals() {
     return;
   }
 
-  const { data: withdrawals, error } = await supabaseAdmin
+  const nowIso = new Date().toISOString();
+  let query = supabaseAdmin
     .from("wallet_transactions")
     .select(
-      "id, driver_id, amount, payout_attempted_at, settlement_ref, settle_attempts",
+      "id, driver_id, amount, payout_attempted_at, settlement_ref, settle_attempts, retry_count, max_retries, next_retry_at",
     )
     .eq("txn_type", "withdrawal")
     .eq("status", "pending")
     .is("settled_at", null)
     .order("created_at", { ascending: true })
     .limit(BATCH_LIMIT);
+
+  const { data: withdrawals, error } = await query;
 
   if (error) {
     logger.error(
@@ -204,11 +248,15 @@ export async function settlePendingWithdrawals() {
   }
 
   for (const withdrawal of withdrawals) {
+    // If next_retry_at is in the future, skip until scheduled time
+    if (withdrawal.next_retry_at && new Date(withdrawal.next_retry_at) > new Date(nowIso)) {
+      continue;
+    }
+
     let settlementRef = withdrawal.settlement_ref;
 
     if (!withdrawal.payout_attempted_at) {
-      // 1. ATOMIC CLAIM: reserve the row BEFORE dispatching so two concurrent
-      //    sweeps cannot both call dispatchPayout for the same withdrawal.
+      // 1. ATOMIC CLAIM
       const claimed = await claimWithdrawal(withdrawal.id);
       if (!claimed) {
         logger.info(
@@ -224,14 +272,6 @@ export async function settlePendingWithdrawals() {
         });
         settlementRef = result.settlementRef;
 
-        // 2. Persist the dispatch outcome BEFORE the completion RPC so a crash
-        //    in between is detected and settled (not failed) on the next sweep.
-        //    The payout has ALREADY left the platform here, so a failure to
-        //    persist the settlement reference must NOT fall through to the
-        //    dispatch-failure handler below (which would restore funds and
-        //    double-pay the driver). We log, keep the in-memory settlementRef
-        //    for this sweep's settle call, and let the next sweep retry the
-        //    write.
         try {
           await recordDispatchOutcome(withdrawal.id, settlementRef);
         } catch (recordErr) {
@@ -241,18 +281,58 @@ export async function settlePendingWithdrawals() {
         }
       } catch (err) {
         if (isAmbiguousDispatchError(err)) {
-          // The payout may already have been committed at the gateway before
-          // the request errored (timeout/network/5xx/unknown). Restoring the
-          // reserved funds here would double-pay the driver, so leave the
-          // withdrawal pending for manual reconciliation / the next sweep.
-          logger.error(
-            `[WithdrawalSettlementWorker] Withdrawal ${withdrawal.id} dispatch returned ambiguous error — leaving pending for reconciliation: ${err.message}`,
-          );
+          const currentRetries = withdrawal.retry_count || 0;
+          const maxRetries = withdrawal.max_retries || DEFAULT_MAX_RETRIES;
+
+          if (currentRetries < maxRetries) {
+            const delaySec = calculateBackoffDelaySeconds(currentRetries);
+            logger.warn(
+              `[WithdrawalSettlementWorker] Withdrawal ${withdrawal.id} ambiguous error (attempt ${currentRetries + 1}/${maxRetries}) — scheduling retry in ${delaySec}s: ${err.message}`,
+            );
+
+            await supabaseAdmin.rpc("schedule_withdrawal_retry", {
+              p_withdrawal_id: withdrawal.id,
+              p_error: String(err.message || "Ambiguous timeout / network error").slice(0, 1000),
+              p_delay_seconds: delaySec,
+            });
+
+            try {
+              await sendPushNotification(
+                withdrawal.driver_id,
+                "Withdrawal Retrying",
+                "We experienced a temporary delay processing your withdrawal. It will be retried automatically.",
+                "payment",
+                { withdrawal_id: withdrawal.id, status: "retrying" },
+              );
+            } catch (notifErr) {
+              logger.warn(`[WithdrawalSettlementWorker] Failed to send retry push notification: ${notifErr.message}`);
+            }
+          } else {
+            logger.error(
+              `[WithdrawalSettlementWorker] Withdrawal ${withdrawal.id} exceeded max retries (${maxRetries}) — moving to DLQ: ${err.message}`,
+            );
+
+            await supabaseAdmin.rpc("move_withdrawal_to_dlq", {
+              p_withdrawal_id: withdrawal.id,
+              p_reason: `Exceeded max retries (${maxRetries}): ${err.message}`,
+            });
+
+            try {
+              await sendPushNotification(
+                withdrawal.driver_id,
+                "Withdrawal Under Review",
+                "Your withdrawal is currently under review by our operations team. Your funds remain secured.",
+                "payment",
+                { withdrawal_id: withdrawal.id, status: "under_review" },
+              );
+            } catch (notifErr) {
+              logger.warn(`[WithdrawalSettlementWorker] Failed to send DLQ push notification: ${notifErr.message}`);
+            }
+          }
           continue;
         }
 
-        // The payout never left the platform — safe to restore the reserved
-        // funds to wallet_confirmed.
+        // The payout never left the platform — safe to restore the reserved funds
         logger.error(
           `[WithdrawalSettlementWorker] Withdrawal ${withdrawal.id} payout dispatch failed: ${err.message}`,
         );
@@ -269,20 +349,23 @@ export async function settlePendingWithdrawals() {
           logger.error(
             `[WithdrawalSettlementWorker] Failed to mark withdrawal ${withdrawal.id} as failed: ${failErr.message}`,
           );
+        } else {
+          try {
+            await sendPushNotification(
+              withdrawal.driver_id,
+              "Withdrawal Failed",
+              "Your withdrawal could not be completed. The reserved funds have been restored to your wallet.",
+              "payment",
+              { withdrawal_id: withdrawal.id, status: "failed" },
+            );
+          } catch (notifErr) {
+            logger.warn(`[WithdrawalSettlementWorker] Failed to send failure push notification: ${notifErr.message}`);
+          }
         }
         continue;
       }
     }
 
-    // The payout has already been dispatched (payout_attempted_at is set), so
-    // never call fail_withdrawal_tx here — restoring wallet_confirmed would
-    // double-pay the driver. Keep the row 'pending' and let the next sweep
-    // retry the idempotent settle call. If the settlement reference is still
-    // missing, the row may have been claimed but the settlement_ref persist
-    // failed on a previous sweep (Issue #14686). We must NOT silently skip it
-    // — that permanently orphans the driver's funds. Instead, re-derive the
-    // reference from the provider, and only escalate to reconciliation/DLQ when
-    // it genuinely cannot be recovered.
     if (!settlementRef) {
       const attemptedAt = withdrawal.payout_attempted_at
         ? Date.parse(withdrawal.payout_attempted_at)
@@ -323,14 +406,19 @@ export async function settlePendingWithdrawals() {
       logger.info(
         `[WithdrawalSettlementWorker] Settled withdrawal ${withdrawal.id} (ref: ${settlementRef}).`,
       );
+
+      try {
+        await sendPushNotification(
+          withdrawal.driver_id,
+          "Withdrawal Completed",
+          "Your wallet withdrawal has been processed and paid out successfully.",
+          "payment",
+          { withdrawal_id: withdrawal.id, status: "completed", settlement_ref: settlementRef },
+        );
+      } catch (notifErr) {
+        logger.warn(`[WithdrawalSettlementWorker] Failed to send completion push notification: ${notifErr.message}`);
+      }
     } catch (err) {
-      // The payout already left the platform, so funds must NEVER be restored.
-      // Record the settle failure and, once the bounded settle-retry budget is
-      // exhausted, transition the row to the terminal `settlement_failed`
-      // status (record_settle_failure with p_terminal => true) so the sweep
-      // predicate (status='pending') stops selecting it. The migration
-      // increments settle_attempts on every call, so the persisted counter is
-      // the source of truth for how many settle cycles have failed.
       const attempts = (withdrawal.settle_attempts || 0) + 1;
       const terminal = attempts >= SETTLE_RETRY_ATTEMPTS;
       const errorMsg = String(err.message || "Unknown error").slice(0, 1000);
@@ -356,11 +444,21 @@ export async function settlePendingWithdrawals() {
       }
 
       if (terminal) {
-        // One-time terminal alert: the row has moved to settlement_failed and
-        // will no longer be retried — manual reconciliation is required.
         logger.error(
           `[WithdrawalSettlementWorker] Withdrawal ${withdrawal.id} settlement permanently failed after ${attempts} attempts — moved to terminal settlement_failed status. ALERT: manual reconciliation required (funds NOT restored).`,
         );
+
+        try {
+          await sendPushNotification(
+            withdrawal.driver_id,
+            "Withdrawal Under Review",
+            "Your withdrawal has been queued for manual review by our finance team.",
+            "payment",
+            { withdrawal_id: withdrawal.id, status: "under_review" },
+          );
+        } catch (notifErr) {
+          logger.warn(`[WithdrawalSettlementWorker] Failed to send review push notification: ${notifErr.message}`);
+        }
       } else {
         logger.error(
           `[WithdrawalSettlementWorker] Settlement of withdrawal ${withdrawal.id} deferred (attempt ${attempts}/${SETTLE_RETRY_ATTEMPTS}) — payout already dispatched, funds NOT restored: ${err.message}`,
@@ -373,7 +471,7 @@ export async function settlePendingWithdrawals() {
 export const startWithdrawalSettlementWorker = () => {
   if (intervalId) return;
 
-  const INTERVAL_MS = 60 * 1000; // Poll every 1 minute
+  const INTERVAL_MS = 5 * 60 * 1000; // Batch process every 5 minutes
 
   const tracedHandler = WorkerTracer.wrapIntervalWorker(
     "withdrawal-settlement-worker",

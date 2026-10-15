@@ -28,8 +28,8 @@ void main() {
   group('MarketplaceRepository.fetchLoadOffers', () {
     test('returns parsed LoadOffer list on success', () async {
       final client = MockClient((request) async {
-        expect(request.url.path, '/api/orders/load-offers');
-        return http.Response(jsonEncode([_loadOfferRow]), 200);
+        expect(request.url.path, '/api/loads');
+        return http.Response.bytes(utf8.encode(jsonEncode([_loadOfferRow])), 200, headers: {'content-type': 'application/json; charset=utf-8'});
       });
 
       final offers = await _repository(client).fetchLoadOffers();
@@ -57,16 +57,13 @@ void main() {
 
     test('unwraps { loads } envelope returned by the marketplace endpoint', () async {
       final client = MockClient((request) async {
-        expect(request.url.path, '/api/orders/load-offers');
-        return http.Response(
-          jsonEncode({
+        expect(request.url.path, '/api/loads');
+        return http.Response.bytes(utf8.encode(jsonEncode({
             'page': 1,
             'limit': 20,
             'total': 1,
             'loads': [_loadOfferRow],
-          }),
-          200,
-        );
+          })), 200, headers: {'content-type': 'application/json; charset=utf-8'});
       });
 
       final offers = await _repository(client).fetchLoadOffers();
@@ -155,12 +152,9 @@ void main() {
     test('unwraps { loads } envelope returned by the en-route endpoint', () async {
       final client = MockClient((request) async {
         expect(request.url.path, '/api/orders/load-offers/en-route');
-        return http.Response(
-          jsonEncode({
+        return http.Response.bytes(utf8.encode(jsonEncode({
             'loads': [_loadOfferRow],
-          }),
-          200,
-        );
+          })), 200, headers: {'content-type': 'application/json; charset=utf-8'});
       });
 
       final loads = await _repository(client).fetchEnRouteLoads(
@@ -184,6 +178,56 @@ void main() {
     });
   });
 
+  group('MarketplaceRepository.fetchDriverBids', () {
+    test('parses bids from a { bids } response envelope', () async {
+      final client = MockClient((request) async {
+        expect(request.url.path, '/api/driver/bids');
+        return http.Response.bytes(utf8.encode(jsonEncode({
+            'bids': [
+              {
+                'id': 'bid-1',
+                'load_id': 'load-1',
+                'driver_id': 'driver-1',
+                'bid_amount': 150000,
+                'status': 'pending',
+              },
+            ],
+          })), 200, headers: {'content-type': 'application/json; charset=utf-8'});
+      });
+
+      final bids = await _repository(client).fetchDriverBids();
+
+      expect(bids, hasLength(1));
+      expect(bids.first.id, 'bid-1');
+      expect(bids.first.loadId, 'load-1');
+      expect(bids.first.driverId, 'driver-1');
+      expect(bids.first.amount, 1500);
+      expect(bids.first.status.name, 'pending');
+    });
+
+    test('parses bids from a bare list response', () async {
+      final client = MockClient((request) async {
+        expect(request.url.path, '/api/driver/bids');
+        return http.Response.bytes(utf8.encode(jsonEncode([
+            {
+              'id': 'bid-2',
+              'load_id': 'load-2',
+              'driver_id': 'driver-2',
+              'bid_amount': 200000,
+              'status': 'accepted',
+            },
+          ])), 200, headers: {'content-type': 'application/json; charset=utf-8'});
+      });
+
+      final bids = await _repository(client).fetchDriverBids();
+
+      expect(bids, hasLength(1));
+      expect(bids.first.id, 'bid-2');
+      expect(bids.first.amount, 2000);
+      expect(bids.first.status.name, 'accepted');
+    });
+  });
+
   group('MarketplaceRepository.submitBid', () {
     test('posts paisa-converted bid amount and parses response', () async {
       final client = MockClient((request) async {
@@ -191,8 +235,7 @@ void main() {
         expect(request.url.path, '/api/orders/load-1/bids');
         final body = jsonDecode(request.body) as Map<String, dynamic>;
         expect(body['bid_amount'], 150000);
-        return http.Response(
-          jsonEncode({
+        return http.Response.bytes(utf8.encode(jsonEncode({
             'bid': {
               'id': 'bid-1',
               'load_id': 'load-1',
@@ -200,9 +243,7 @@ void main() {
               'bid_amount': 150000,
               'status': 'pending',
             },
-          }),
-          200,
-        );
+          })), 200, headers: {'content-type': 'application/json; charset=utf-8'});
       });
 
       final bid = await _repository(client).submitBid(loadId: 'load-1', amount: 1500);

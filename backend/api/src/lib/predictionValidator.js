@@ -57,8 +57,8 @@ const DEFAULT_PRICE_BAND_RATIO = 0.15;
  * @returns {{ ok: true, validated: ValidatedPrice } | { ok: false, reason: string, detail: string }}
  */
 export function validatePricePrediction(raw) {
-  // ── Null / undefined ────────────────────────────────────────────────
-  if (raw === null || raw === undefined) {
+  // ── Null / undefined guard ──────────────────────────────────────────
+  if (!raw || raw === null || raw === undefined) {
     return reject(RejectionReason.NULL_RESPONSE, 'Prediction response is null or undefined');
   }
 
@@ -103,6 +103,10 @@ export function validatePricePrediction(raw) {
   if ('min_price' in raw) {
     if (typeof raw.min_price !== 'number' || !Number.isFinite(raw.min_price)) {
       return reject(RejectionReason.INVALID_MIN_PRICE, `min_price is not a finite number: ${raw.min_price}`);
+    }
+    // Reject before rounding: small negatives must not become a valid zero band.
+    if (raw.min_price < 0) {
+      return reject(RejectionReason.INVALID_MIN_PRICE, `min_price must be nonnegative, got ${raw.min_price}`);
     }
     if (raw.min_price > price) {
       return reject(RejectionReason.INVALID_MIN_PRICE, `min_price ${raw.min_price} exceeds estimated_price ${price}`);
@@ -167,4 +171,8 @@ function roundPrice(value) {
   return Math.round(value * 100) / 100;
 }
 
+export const validatePrediction = validatePricePrediction;
+
 export const __testing = { MIN_PRICE_INR, MAX_PRICE_INR, MAX_BAND_RATIO };
+
+export default validatePricePrediction;

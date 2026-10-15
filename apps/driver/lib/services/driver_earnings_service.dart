@@ -26,43 +26,6 @@ class DriverEarningsService {
   static const Duration _cacheTtl = Duration(minutes: 5);
   DateTime? _lastCacheTime;
 
-  bool _isCacheValid() {
-    if (_cache.isEmpty) return false;
-    if (_lastCacheTime == null) return false;
-    return DateTime.now().difference(_lastCacheTime!) < _cacheTtl;
-  }
-
-  void _clearCache() {
-    _cache.clear();
-    _lastCacheTime = null;
-  }
-
-  void _updateCache(Map<String, dynamic> data) {
-    _cache.clear();
-    _cache.addAll(data);
-    _lastCacheTime = DateTime.now();
-  }
-
-  Future<Map<String, dynamic>?> _getCached(String key) async {
-    if (!_isCacheValid()) return null;
-    return _cache[key] as Map<String, dynamic>?;
-  }
-
-  DateTime? _parseDate(String dateStr) {
-    try {
-      return DateTime.parse(dateStr);
-    } catch (e) {
-      debugPrint('[DriverEarningsService] Failed to parse date "$dateStr": $e');
-      return null;
-    }
-  }
-
-  bool _isWithinRange(DateTime target, DateTime? start, DateTime? end) {
-    if (start != null && target.isBefore(start)) return false;
-    if (end != null && target.isAfter(end)) return false;
-    return true;
-  }
-
   List<Map<String, dynamic>> _mapResponseRows(Object? response, String label) {
     if (response is! List) {
       throw StateError('Unexpected $label response type');
@@ -86,7 +49,7 @@ class DriverEarningsService {
 
     try {
       final decoded = await _apiClient.get(path);
-      
+
       if (decoded is! Map) {
         throw Exception('Invalid wallet history response format.');
       }
@@ -105,6 +68,11 @@ class DriverEarningsService {
           .toList();
     } catch (e) {
       if (e is StateError) {
+        throw Exception(e.message);
+      }
+      if (e is ApiAuthException) {
+        // Auth failures must not masquerade as generic network errors —
+        // ApiAuthException is not an ApiException subtype.
         throw Exception(e.message);
       }
       if (e is ApiException) {
@@ -131,7 +99,7 @@ class DriverEarningsService {
 
     try {
       final decoded = await _apiClient.get(path);
-      
+
       if (decoded is! List) {
         throw Exception('Invalid earnings summary response format.');
       }
@@ -155,6 +123,11 @@ class DriverEarningsService {
           })
           .toList();
     } catch (e) {
+      if (e is ApiAuthException) {
+        // Auth failures must not masquerade as generic network errors —
+        // ApiAuthException is not an ApiException subtype.
+        throw Exception(e.message);
+      }
       if (e is ApiException) {
         throw Exception(e.message.isNotEmpty ? e.message : 'Failed to load earnings summary.');
       }
@@ -195,7 +168,7 @@ class DriverEarningsService {
 
     try {
       final decoded = await _apiClient.get(path);
-      
+
       if (decoded is! List) {
         throw StateError('Unexpected earnings summary response type');
       }
@@ -215,6 +188,11 @@ class DriverEarningsService {
       if (e is StateError) {
         throw Exception(e.message);
       }
+      if (e is ApiAuthException) {
+        // Auth failures must not masquerade as generic network errors —
+        // ApiAuthException is not an ApiException subtype.
+        throw Exception(e.message);
+      }
       if (e is ApiException) {
         throw Exception(e.message.isNotEmpty ? e.message : 'Failed to load today\'s earnings.');
       }
@@ -230,7 +208,7 @@ class DriverEarningsService {
 
     try {
       final decoded = await _apiClient.get(path);
-      
+
       if (decoded is! Map) {
         throw StateError('Unexpected driver stats response type');
       }
@@ -242,6 +220,11 @@ class DriverEarningsService {
       throw StateError('Unexpected driver stats payload type');
     } catch (e) {
       if (e is StateError) {
+        throw Exception(e.message);
+      }
+      if (e is ApiAuthException) {
+        // Auth failures must not masquerade as generic network errors —
+        // ApiAuthException is not an ApiException subtype.
         throw Exception(e.message);
       }
       if (e is ApiException) {
@@ -259,14 +242,10 @@ class DriverEarningsService {
         .select('wallet_confirmed, wallet_pending, wallet_total')
         .eq('user_id', driverId!);
 
-    if (response is! List) {
-      throw StateError('Unexpected wallet summary response type');
-    }
+    // postgrest returns List<Map<String, dynamic>>; the copy keeps a runtime
+    // safety net without dead type checks (the SDK type makes them static).
     if (response.isNotEmpty) {
-      final first = response.first;
-      if (first is Map<String, dynamic>) return first;
-      if (first is Map) return Map<String, dynamic>.from(first);
-      throw StateError('Unexpected wallet summary item type');
+      return Map<String, dynamic>.from(response.first as Map);
     }
     return {};
   }
@@ -277,7 +256,14 @@ class DriverEarningsService {
   ///
   /// Throws [ApiException] on non-2xx responses with the server error message.
   /// Throws a generic [Exception] on network errors.
-  Future<void> withdrawFunds(int amountPaisa) async {
+  /// Withdraws funds from the driver's confirmed wallet balance.
+  ///
+  /// [amountPaisa] must be a positive integer representing the amount in paisa.
+  /// [idempotencyKey] optional stable key to guarantee at-most-once execution across retries.
+  ///
+  /// Throws [ApiException] on non-2xx responses with the server error message.
+  /// Throws a generic [Exception] on network errors.
+  Future<void> withdrawFunds(int amountPaisa, {String? idempotencyKey}) async {
     if (driverId == null) {
       throw Exception('You must be logged in to withdraw funds.');
     }
@@ -285,13 +271,17 @@ class DriverEarningsService {
     final path = '/api/driver/wallet/withdraw';
 
     try {
-      await _apiClient.post(path, body: {
-        'amount': amountPaisa,
-      });
+      await _apiClient.post(
+        path,
+        body: {
+          'amount': amountPaisa,
+        },
+        idempotencyKey: idempotencyKey,
+      );
     } on ApiException {
       rethrow;
     } catch (e) {
-      throw Exception('Network error: Failed to withdraw funds.');
+      throw Exception('Network error: $e');
     }
   }
 
@@ -347,6 +337,11 @@ class DriverEarningsService {
       }
       return Map<String, dynamic>.from(decoded);
     } catch (e) {
+      if (e is ApiAuthException) {
+        // Auth failures must not masquerade as generic network errors —
+        // ApiAuthException is not an ApiException subtype.
+        throw Exception(e.message);
+      }
       if (e is ApiException) {
         throw Exception(e.message.isNotEmpty ? e.message : 'Failed to load earnings analytics.');
       }
