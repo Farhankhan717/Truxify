@@ -23,6 +23,10 @@ export const COMPRESSION_THRESHOLD_BYTES = Number.isFinite(_parsedThreshold) && 
   ? Math.floor(_parsedThreshold)
   : 1024;
 // backend/api/src/config/compression.js
+export const COMPRESSION_THRESHOLD_BYTES =
+  Number.isFinite(_parsedThreshold) && _parsedThreshold > 0
+    ? Math.floor(_parsedThreshold)
+    : 1024;
 
 /**
  * Safely parses numeric environment variables with a fallback default.
@@ -49,9 +53,10 @@ export const compressionConfig = {
  * little additional saving on JSON.
  */
 const _parsedLevel = Number(process.env.COMPRESSION_LEVEL || 6);
-export const COMPRESSION_LEVEL = Number.isFinite(_parsedLevel) && _parsedLevel >= 1 && _parsedLevel <= 9
-  ? Math.round(_parsedLevel)
-  : 6;
+export const COMPRESSION_LEVEL =
+  Number.isFinite(_parsedLevel) && _parsedLevel >= 1 && _parsedLevel <= 9
+    ? Math.round(_parsedLevel)
+    : 6;
 
 /**
  * Content types that are already compressed. Re-compressing them burns CPU
