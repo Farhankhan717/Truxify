@@ -10,6 +10,27 @@ import { scheduleEtaRecalculationOnLocationUpdate } from '../services/order/etaS
 import DeliveryDelayService from '../services/order/deliveryDelayService.js';
 import { calculateAdaptiveInterval, getQueueDepth } from './adaptivePoller.js';
 
+
+// backend/api/src/sockets/tracker.js (Excerpt from Supabase authentication branch)
+
+// BEFORE:
+// const { data: profile, error } = await supabaseAdmin
+//   .from('profiles')
+//   .select('id, firebase_uid, role')
+//   .eq('id', user.id)
+//   .maybeSingle();
+
+// FIX: Query profiles table by firebase_uid
+const { data: profile, error } = await supabaseAdmin
+  .from('profiles')
+  .select('id, firebase_uid, role')
+  .eq('firebase_uid', user.id)
+  .maybeSingle();
+
+if (error || !profile) {
+  logger.warn('WebSocket authentication failed: User profile not found', { authUid: user.id });
+  return socket.disconnect(true, '4001 User profile not found');
+}
 const TELEMETRY_SCHEMA = {
   lat: { type: 'number', required: false, min: -90, max: 90 },
   lng: { type: 'number', required: false, min: -180, max: 180 },
