@@ -4,7 +4,44 @@
  */
 import logger from '../middleware/logger.js';
 import logger from '../middleware/logger.js';
+// backend/api/src/services/weighStationService.js
 
+// backend/api/src/services/weighStationService.js
+
+/**
+ * Checks bypass eligibility for a weigh station.
+ * NOTE: This is currently a deterministic mock service. It must be replaced
+ * with a real regulatory API integration before production deployment.
+ * Fixed per issue #8956.
+ */
+export async function checkBypassEligibility(vehicleId, stationId, metadata = {}) {
+  // Deterministic mock response instead of Math.random() coin-flip
+  return {
+    action: 'BYPASS',
+    simulated: true,
+    reason: 'Deterministic mock compliance check passed',
+    vehicleId,
+    stationId,
+    timestamp: new Date().toISOString()
+  };
+}
+/**
+ * Checks bypass eligibility for a weigh station.
+ * NOTE: This is currently a deterministic mock service. It must be replaced
+ * with a real regulatory API integration before production deployment.
+ * Fixed per issue #8956.
+ */
+export async function checkBypassEligibility(vehicleId, stationId, metadata = {}) {
+  // Deterministic mock response instead of Math.random() coin-flip
+  return {
+    action: 'BYPASS',
+    simulated: true,
+    reason: 'Deterministic mock compliance check passed',
+    vehicleId,
+    stationId,
+    timestamp: new Date().toISOString()
+  };
+}
 /**
  * Checks weigh station bypass eligibility for a given trip/truck.
  * NOTE: This is currently a mock service and must be replaced with a real regulatory API integration before production rollout.
