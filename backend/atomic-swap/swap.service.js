@@ -2,6 +2,12 @@ import { ethers } from 'ethers';
 import crypto from 'crypto';
 import logger from '../api/src/middleware/logger.js';
 import { supabase } from '../api/src/config/db.js';
+/**
+ * Atomic Swap Service
+ * 
+ * Interacts with the deployed AtomicSwap.sol smart contract on the Polygon / EVM network.
+ * Aligns ethers.js contract calls and ABI definitions with the actual contract specification.
+ */
 import { atomicSwapRelayer } from './swap_relayer.js';
 
 class AtomicSwapService {

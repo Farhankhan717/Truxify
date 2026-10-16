@@ -1,6 +1,121 @@
+/**
+ * @openapi
+ * components:
+ *   schemas:
+ *     HealthResponse:
+ *       type: object
+ *       properties:
+ *         status:
+ *           type: string
+ *           enum: [ok, degraded]
+ *         services:
+ *           type: object
+ *           properties:
+ *             supabase:
+ *               type: string
+ *               enum: [connected, failed, not_configured]
+ *             mongodb:
+ *               type: string
+ *               enum: [connected, failed, not_configured]
+ *             redis:
+ *               type: string
+ *               enum: [connected, failed, not_configured]
+ *             firebase:
+ *               type: string
+ *               enum: [configured, not_configured]
+ *             polygon:
+ *               type: string
+ *               enum: [configured, not_configured]
+ *         uptime:
+ *           type: number
+ *         memory:
+ *           type: object
+ *           properties:
+ *             rss:
+ *               type: number
+ *             heapTotal:
+ *               type: number
+ *             heapUsed:
+ *               type: number
+ *             external:
+ *               type: number
+ *     LivenessResponse:
+ *       type: object
+ *       properties:
+ *         status:
+ *           type: string
+ *           enum: [ok]
+ *         uptime:
+ *           type: number
+ *     ReadinessResponse:
+ *       type: object
+ *       properties:
+ *         status:
+ *           type: string
+ *           enum: [ready, not_ready]
+ *         services:
+ *           type: object
+ */
+
 import express from 'express';
+import { supabase, supabaseAdmin, mongoDb, redisClient, firebaseAdmin } from '../config/db.js';
+import { healthLimiter } from '../middleware/rateLimiter.js';
+import { checkEscrowHealth } from '../services/escrow.js';
+import logger from '../middleware/logger.js';
+import { createDefaultAggregator } from '../core/health/index.js';
+import { captureDebugException } from '../middleware/sentry.js';
+import express from 'express';
+import * as Sentry from '@sentry/node';
 import logger from '../middleware/logger.js';
 
+const router = express.Router();
+
+// ... existing health check routes ...
+
+/**
+ * GET /api/health/sentry-debug
+ * Triggers a test exception capture via Sentry for instrumentation verification.
+ */
+router.get('/sentry-debug', async (req, res) => {
+  try {
+    const testError = new Error('Sentry Test Error from Truxify Node.js Backend');
+    
+    // Explicitly capture exception with Sentry if initialized
+    if (Sentry && typeof Sentry.captureException === 'function') {
+      const eventId = Sentry.captureException(testError, {
+        tags: {
+          endpoint: '/api/health/sentry-debug',
+          environment: process.env.NODE_ENV || 'development'
+        },
+        extra: {
+          timestamp: new Date().toISOString(),
+          requestedBy: req.ip
+        }
+      });
+
+      logger.info({ eventId }, 'Sentry debug test exception captured successfully');
+      
+      return res.status(200).json({
+        success: true,
+        message: 'Sentry test exception captured and sent successfully.',
+        sentryEventId: eventId
+      });
+    } else {
+      // Fallback if Sentry is not active in the current environment
+      logger.warn('Sentry is not initialized; test error logged locally.');
+      throw testError;
+    }
+  } catch (err) {
+    logger.error({ error: err.message }, 'Failed to process Sentry debug endpoint');
+    return res.status(500).json({
+      success: false,
+      error: 'Sentry SDK not configured or capture failed',
+      details: err.message
+    });
+  }
+});
+
+export default router;
 const router = express.Router();
 
 const DEFAULT_TIMEOUT_MS = 400;
@@ -19,9 +134,6 @@ function withTimeout(promise) {
 }
 
 async function checkSupabase() {
-  // Probe through the service-role client: anon privileges on profiles are
-  // revoked by revoke_anon_privileges.sql, so an anon-keyed probe would always
-  // report 42501 permission denied even when Supabase is reachable.
   const client = supabaseAdmin || supabase;
   if (!client) return 'not_configured';
   try {
@@ -30,7 +142,7 @@ async function checkSupabase() {
     );
     return error ? 'failed' : 'connected';
   } catch (err) {
-    logger.error({ event: 'HEALTH_SUPABASE_ERROR', error: err?.message }, '[health] Supabase check failed');
+    logger.error({ event: 'HEALTH_SUPABASE_CHECK_FAILED', error: err?.message }, 'Supabase check failed');
     return 'failed';
   }
 }
@@ -41,7 +153,7 @@ async function checkMongo() {
     await withTimeout(mongoDb.admin().ping());
     return 'connected';
   } catch (err) {
-    logger.error({ event: 'HEALTH_MONGO_ERROR', error: err?.message }, '[health] MongoDB check failed');
+    logger.error({ event: 'HEALTH_MONGODB_CHECK_FAILED', error: err?.message }, 'MongoDB check failed');
     return 'failed';
   }
 }
@@ -52,24 +164,21 @@ async function checkRedis() {
     const reply = await withTimeout(redisClient.ping());
     return reply === 'PONG' ? 'connected' : 'failed';
   } catch (err) {
-    logger.error({ event: 'HEALTH_REDIS_ERROR', error: err?.message }, '[health] Redis check failed');
+    logger.error({ event: 'HEALTH_REDIS_CHECK_FAILED', error: err?.message }, 'Redis check failed');
     return 'failed';
   }
 }
-router.get('/health', async (req, res) => {
+
+function checkFirebase() {
+  return firebaseAdmin ? 'configured' : 'not_configured';
+}
+
+async function checkEscrow() {
   try {
-    // Replaced console.log with structured logger.info
-    logger.info({ requestId: req.id }, 'Health check probe requested');
-
-    const healthStatus = {
-      status: 'UP',
-      timestamp: new Date().toISOString(),
-      uptime: process.uptime(),
-    };
-
-    res.status(200).json(healthStatus);
+    const result = await checkEscrowHealth();
+    return result.status;
   } catch (err) {
-    logger.error({ event: 'HEALTH_ESCROW_ERROR', error: err?.message }, '[Health] checkEscrow failed');
+    logger.error({ event: 'HEALTH_ESCROW_CHECK_FAILED', error: err?.message || err }, 'checkEscrow failed');
     return 'failed';
   }
 }
@@ -79,8 +188,6 @@ function checkPolygon() {
 }
 
 const CRITICAL_UNHEALTHY = new Set(['failed', 'not_configured']);
-// MongoDB is optional telemetry storage: only a configured-but-unreachable
-// instance should affect dependency health.
 const CRITICAL_UNHEALTHY_MONGO = new Set(['failed']);
 
 /**
@@ -126,9 +233,6 @@ router.get('/', healthLimiter, async (req, res) => {
       polygon: checkPolygon(),
     };
 
-    // Redis is a non-critical cache: every consumer has an in-memory fallback,
-    // so a Redis failure is reported in `services` but does not degrade overall
-    // health. Supabase and MongoDB remain critical.
     const criticalFailed =
       CRITICAL_UNHEALTHY.has(supabaseStatus) ||
       CRITICAL_UNHEALTHY_MONGO.has(mongoStatus);
@@ -222,24 +326,42 @@ router.get('/ready', healthLimiter, async (req, res) => {
 
   logger.info({ event: 'HEALTH_READINESS_SUCCESS' }, 'Readiness probe passed.');
   return res.status(200).json({ status: 'ready', services });
-    // Replaced console.error with structured logger.error
-    logger.error({ err, requestId: req.id }, 'Health check probe failed');
-    res.status(500).json({ status: 'DOWN', error: 'Internal Health Check Error' });
-  }
 });
 
-router.get('/diagnostics', async (req, res) => {
+// ============================================================================
+// Centralized Health Aggregation Endpoint
+// ============================================================================
+
+const aggregator = createDefaultAggregator();
+
+/**
+ * @openapi
+ * /api/health/full:
+ *   get:
+ *     tags: [Health]
+ *     summary: Centralized health aggregation for all distributed components
+ *     description: >
+ *       Returns a unified health response covering all major backend services
+ *       including databases, message queues, ML engine, GraphQL gateway,
+ *       WebSocket server, blockchain, and background workers.
+ *     security:
+ *       - {}
+ *     responses:
+ *       200:
+ *         description: All critical services healthy
+ *       503:
+ *         description: One or more critical services degraded
+ */
+router.get('/full', healthLimiter, async (req, res) => {
   try {
     const result = await aggregator.aggregate();
-    // 200 = system operational (healthy or degraded with non-critical failures)
-    // 503 = system not operational (critical services down)
     const httpStatus = result.status === 'unhealthy' ? 503 : 200;
     logger.info({ event: 'HEALTH_AGGREGATION_SUCCESS', status: result.status }, 'Aggregated health check completed.');
     return res.status(httpStatus).json(result);
   } catch (err) {
     logger.error(
-      { event: 'HEALTH_AGGREGATION_ERROR', requestId: req.requestId || req.id, error: err && err.message },
-      '[health] Aggregated health check failed',
+      { event: 'HEALTH_AGGREGATED_CHECK_FAILED', requestId: req.requestId || req.id, error: err && err.message },
+      'Aggregated health check failed',
     );
     return res.status(500).json({
       status: 'unhealthy',
@@ -248,19 +370,20 @@ router.get('/diagnostics', async (req, res) => {
     });
   }
 });
-    logger.info({ requestId: req.id }, 'Diagnostics check requested');
 
-    const diagnosticsInfo = {
-      memoryUsage: process.memoryUsage(),
-      nodeVersion: process.version,
-      env: process.env.NODE_ENV || 'development',
-    };
-
-    res.status(200).json(diagnosticsInfo);
-  } catch (err) {
-    logger.error({ err, requestId: req.id }, 'Diagnostics check failed');
-    res.status(500).json({ status: 'ERROR', error: 'Internal Diagnostics Error' });
+router.get('/sentry-debug', healthLimiter, (req, res) => {
+  if (process.env.SENTRY_DEBUG_ENABLED !== 'true' || process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ error: 'Not found' });
   }
+
+  const err = new Error('Sentry Test Error from Node.js Backend');
+  err.name = 'SentryDebugTestError';
+  const eventId = captureDebugException(err);
+
+  if (eventId) {
+    return res.status(200).json({ sent: true, eventId });
+  }
+  return res.status(503).json({ sent: false, error: 'Sentry is not configured (SENTRY_DSN unset).' });
 });
 
 export default router;

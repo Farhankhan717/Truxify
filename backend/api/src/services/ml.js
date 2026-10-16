@@ -2,10 +2,127 @@ import logger from '../middleware/logger.js';
 import { mlMatchingGateway } from './mlMatchingGateway.js';
 import { validatePricePrediction, convertToPaisa } from '../lib/predictionValidator.js';
 import { LRUCache } from '../utils/cache.js';
-
 const demandCache = new LRUCache(100, 15 * 60 * 1000);
 const priceCache = new LRUCache(100, 15 * 60 * 1000);
+// backend/api/src/services/ml.js
+import axios from 'axios';
+import logger from '../middleware/logger.js';
 
+const ML_BASE_URL = process.env.ML_SERVICE_URL || 'http://localhost:8000';
+const ML_API_KEY = process.env.ML_API_KEY || '';
+
+function getHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    ...(ML_API_KEY ? { 'X-API-Key': ML_API_KEY } : {})
+  };
+}
+
+async function handleResponse(responsePromise, url = '', method = 'GET') {
+  try {
+    const response = await responsePromise;
+    return response.data;
+  } catch (error) {
+    const status = error.response?.status;
+    const errorMsg = error.response?.data?.error || error.message;
+    
+    if (status === 401 || status === 403) {
+      logger.error({ status, url, method, err: errorMsg }, `[ML] Authentication failed (${status}) for ${method} ${url}`);
+      throw new Error(`[ML] Authentication failed (${status})`);
+    }
+    
+    logger.error({ status, url, method, err: errorMsg }, `[ML] Request failed (${status || 'network'}) for ${method} ${url}`);
+    throw new Error(`[ML] Request failed (${status || 'network'})`);
+  }
+}
+
+export function parseWeightKgSafe(value) {
+  if (value === undefined || value === null) return 0;
+  const cleaned = String(value).replace(/[^0-9.]/g, '');
+  const normalized = cleaned.replace(/(\..*?)\..*/g, '$1');
+  const parsed = parseFloat(normalized);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export async function predictDriverProfit(params) {
+  const url = `${ML_BASE_URL}/predict/profit`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function predictDemand(features) {
+  const url = `${ML_BASE_URL}/predict/demand`;
+  return handleResponse(axios.post(url, features, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function predictPrice(params) {
+  const url = `${ML_BASE_URL}/predict/price`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function predictEta(params) {
+  const url = `${ML_BASE_URL}/predict/eta`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function matchDeadhead(params) {
+  const url = `${ML_BASE_URL}/match/deadhead`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function matchEnRouteLoads(params) {
+  const url = `${ML_BASE_URL}/match/en-route`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function optimisePacking(params) {
+  const url = `${ML_BASE_URL}/optimise/packing`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function recommendLoads(params) {
+  const url = `${ML_BASE_URL}/recommend/loads`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function recommendTrucks(params) {
+  const url = `${ML_BASE_URL}/recommend/trucks`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function scoreTrust(params) {
+  const url = `${ML_BASE_URL}/score/trust`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function matchBilateral(params) {
+  const url = `${ML_BASE_URL}/match/bilateral`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function optimiseMidTrip(params) {
+  const url = `${ML_BASE_URL}/optimise/mid-trip`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function trainDemandModel(params) {
+  const url = `${ML_BASE_URL}/train/demand`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function trainPriceModel(params) {
+  const url = `${ML_BASE_URL}/train/price`;
+  return handleResponse(axios.post(url, params, { headers: getHeaders(), timeout: 5000 }), url, 'POST');
+}
+
+export async function listModels() {
+  const url = `${ML_BASE_URL}/models`;
+  return handleResponse(axios.get(url, { headers: getHeaders(), timeout: 5000 }), url, 'GET');
+}
+
+export const __testing = {
+  getHeaders,
+  handleResponse
+};
 // Single source of truth for ML engine base URL
 const DEFAULT_ML_ENGINE_URL = 'http://localhost:8001';
 
@@ -113,6 +230,7 @@ async function handleResponse(response, url = '', method = 'GET') {
     try {
         return JSON.parse(text);
     } catch (err) {
+        // Fixed: Referenced the 'url' parameter correctly instead of an undefined variable
         logger.error({ status: response ? response.status : undefined, url }, `ML service request failed [${method}] ${url}`);
         throw new Error(`[ML] Invalid JSON response from ML engine: ${err?.message ?? String(err)}`, { cause: err });
     }
@@ -224,8 +342,6 @@ export async function predictPrice({
   }
 
   const adjustedPrice = initialValidation.validated.estimated_price * safeMultiplier;
-  // Only forward min_price/max_price keys when the raw response actually
-  // carried valid finite numbers — injecting undefined/NaN/Infinity trips the response validator.
   const revalidated = validatePricePrediction({
       ...raw,
       estimated_price: adjustedPrice,
@@ -276,7 +392,7 @@ export async function predictEta({
   historicalSpeed,
 }) {
   guardMlApiKey();
-  const url = `${getBaseUrl()}/predict/eta`;
+  const url = `${getBaseUrl()}/eta/predict`;
 
   const payload = {
     route_distance: routeDistance,
@@ -449,28 +565,6 @@ export async function predictDriverProfit({
 }
 
 /**
- * Recommends available loads for a user based on collaborative filtering.
- *
- * @param {object} params
- * @param {string}   params.userId         - User ID
- * @param {Array}    [params.bookingHistory] - Past booking history entries
- * @param {Array}    [params.ratedDrivers]   - Previously rated drivers
- * @param {number}   [params.topN=5]         - Number of recommendations (1-50)
- * @returns {Promise<{recommendations: Array}>}
- * @throws {Error} if ML_API_KEY is missing or HTTP fails
- */
-/**
- * Recommends suitable trucks for a user based on collaborative filtering.
- *
- * @param {object} params
- * @param {string}   params.userId         - User ID
- * @param {Array}    [params.bookingHistory] - Past booking history entries
- * @param {Array}    [params.ratedLoads]     - Previously rated loads
- * @param {number}   [params.topN=5]         - Number of recommendations (1-50)
- * @returns {Promise<{recommendations: Array}>}
- * @throws {Error} if ML_API_KEY is missing or HTTP fails
- */
-/**
  * Finds deadhead (return-trip) loads for a truck to avoid empty backhauls.
  * @param {object} params
  * @param {object} params.driverDestination - { lat, lng }
@@ -511,10 +605,10 @@ export async function matchDeadhead({ driverDestination, truckSpecs, arrivalTime
  * the endpoint never returns an empty list when offers exist in the DB.
  *
  * @param {object} params
- * @param {number}   params.currentLat       - Driver's current latitude
- * @param {number}   params.currentLng       - Driver's current longitude
- * @param {Array}    params.offers           - Raw load_offer rows from DB
- * @param {object}   [params.truckSpecs]     - Truck capacity; defaults to generous values
+ * @param {number}   params.currentLat        - Driver's current latitude
+ * @param {number}   params.currentLng        - Driver's current longitude
+ * @param {Array}    params.offers            - Raw load_offer rows from DB
+ * @param {object}   [params.truckSpecs]      - Truck capacity; defaults to generous values
  * @param {number}   [params.maxDetourKm=50] - Max acceptable detour in km
  * @returns {Promise<Array>} - offers enriched with detour_km, extra_earnings, match_score
  */
@@ -568,7 +662,6 @@ export async function matchEnRouteLoads({
   let recommendations = [];
   let mlUsed = false;
 
-  // Try the FastAPI ML engine first
   if (availableLoads.length > 0) {
     try {
       const result = await matchDeadhead({
@@ -584,7 +677,6 @@ export async function matchEnRouteLoads({
     }
   }
 
-  // Haversine fallback — score by distance to pickup
   if (!mlUsed || recommendations.length === 0) {
     mlUsed = false;
     recommendations = offers
@@ -604,19 +696,17 @@ export async function matchEnRouteLoads({
       .sort((a, b) => b.match_score - a.match_score);
   }
 
-  // Build a lookup map of ML results keyed by load_id
   const recMap = new Map(recommendations.map(r => [r.load_id, r]));
 
-  // Merge ML/haversine annotations back onto the original offer rows
   const enriched = offers
     .map(o => {
       const rec = recMap.get(o.id);
-      if (!rec) return null; // not recommended by ML — exclude
+      if (!rec) return null;
       return {
         ...o,
         detour_km: rec.detour_km ?? rec.distance_to_pickup_km ?? 0,
         extra_earnings: rec.estimated_earnings
-          ? Math.round(rec.estimated_earnings * 100) // convert to paisa for consistency
+          ? Math.round(rec.estimated_earnings * 100)
           : (o.freight_value || 0),
         match_score: rec.match_score ?? 0,
         extra_distance_km: rec.detour_km ?? 0,

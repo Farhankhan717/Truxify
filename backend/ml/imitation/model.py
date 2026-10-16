@@ -1,11 +1,21 @@
+from threading import RLock
+from foundation.optimizer_transition import operation_owned, optimizer_transition
+from .reward_transition import admit_reward_optimizer, own_population, own_populations, reward_owned
+import logging
+from numbers import Integral
+from typing import Dict, List, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from typing import Dict, List, Tuple, Any, Optional
-import logging
-from collections import deque
-import random
+from imitation.advisory import (
+    MAX_RULES,
+    AdvisoryAdmissionError,
+    evaluate_rules,
+    own_rule,
+    recommend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,24 +85,44 @@ class InverseRL:
         )
         
         self.optimizer = torch.optim.Adam(self.reward_model.parameters(), lr=1e-3)
+        self._operation_lock = RLock()
         
-        logger.info(f"✅ Inverse RL initialized")
+        logger.info("✅ Inverse RL initialized")
     
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop('_operation_lock', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._operation_lock = RLock()
+
+    @operation_owned
     def infer_reward(self, state: np.ndarray, action: np.ndarray) -> float:
-        """Infer reward from state-action pair"""
-        self.reward_model.eval()
-        with torch.no_grad():
-            state_tensor = torch.tensor(state, dtype=torch.float32)
-            action_tensor = torch.tensor(action, dtype=torch.float32)
-            if len(state_tensor.shape) == 1:
-                state_tensor = state_tensor.unsqueeze(0)
-            if len(action_tensor.shape) == 1:
-                action_tensor = action_tensor.unsqueeze(0)
-            
-            combined = torch.cat([state_tensor, action_tensor], dim=-1)
-            reward = self.reward_model(combined)
-        return reward.item()
-    
+        """Read one owned native reward observation without changing training modes."""
+        state_tensor = torch.as_tensor(state if isinstance(state, torch.Tensor) else np.asarray(state))
+        action_tensor = torch.as_tensor(action if isinstance(action, torch.Tensor) else np.asarray(action))
+        if state_tensor.ndim == 1:
+            state_tensor = state_tensor.unsqueeze(0)
+        if action_tensor.ndim == 1:
+            action_tensor = action_tensor.unsqueeze(0)
+        combined = own_population(self, state_tensor, action_tensor)
+        if len(combined) != 1:
+            raise ValueError("Reward inference requires one paired observation")
+        modes = [(module, module.training) for module in self.reward_model.modules()]
+        try:
+            self.reward_model.eval()
+            with torch.no_grad():
+                reward = self.reward_model(combined)
+            if reward.shape != (1, 1) or not torch.isfinite(reward).all():
+                raise ValueError("Native reward must be a finite scalar")
+            return reward.item()
+        finally:
+            for module, mode in modes:
+                module.training = mode
+
+    @operation_owned
     def train_reward_model(
         self,
         expert_states: np.ndarray,
@@ -101,41 +131,36 @@ class InverseRL:
         learner_actions: np.ndarray,
         epochs: int = 100
     ) -> Dict:
-        """Train reward model using IRL"""
+        """Fit the original expert/learner mean difference through verified epochs."""
+        expert, learner, epochs = own_populations(
+            self, expert_states, expert_actions, learner_states, learner_actions, epochs
+        )
+        admit_reward_optimizer(self)
         losses = []
-        
         for epoch in range(epochs):
-            # Convert to tensors
-            expert_states_t = torch.tensor(expert_states, dtype=torch.float32)
-            expert_actions_t = torch.tensor(expert_actions, dtype=torch.float32)
-            learner_states_t = torch.tensor(learner_states, dtype=torch.float32)
-            learner_actions_t = torch.tensor(learner_actions, dtype=torch.float32)
-            
-            # Expert rewards
-            expert_combined = torch.cat([expert_states_t, expert_actions_t], dim=-1)
-            expert_rewards = self.reward_model(expert_combined)
-            
-            # Learner rewards
-            learner_combined = torch.cat([learner_states_t, learner_actions_t], dim=-1)
-            learner_rewards = self.reward_model(learner_combined)
-            
-            # Loss: maximize expert rewards, minimize learner rewards
-            loss = -torch.mean(expert_rewards) + torch.mean(learner_rewards)
-            
-            # Backward pass
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            
+            with optimizer_transition(self.reward_model, self.optimizer):
+                self.reward_model.train()
+                expert_rewards = self.reward_model(expert)
+                learner_rewards = self.reward_model(learner)
+                if (expert_rewards.shape != (len(expert), 1)
+                        or learner_rewards.shape != (len(learner), 1)
+                        or not torch.isfinite(expert_rewards).all()
+                        or not torch.isfinite(learner_rewards).all()):
+                    raise ValueError("Native reward populations must be finite scalar rows")
+                loss = -expert_rewards.mean() + learner_rewards.mean()
+                if not torch.isfinite(loss):
+                    raise ValueError("Native reward objective must be finite")
+                self.optimizer.zero_grad()
+                loss.backward()
+                # Preserve finite derivatives without adding a clipping algorithm.
+                if any(p.grad is not None and not torch.isfinite(p.grad).all()
+                       for p in self.reward_model.parameters()):
+                    raise ValueError("Native reward derivatives must be finite")
+                self.optimizer.step()
             losses.append(loss.item())
-            
             if (epoch + 1) % 20 == 0:
                 logger.info(f"IRL Epoch {epoch+1}/{epochs}: Loss={loss.item():.4f}")
-        
-        return {
-            'losses': losses,
-            'final_loss': losses[-1]
-        }
+        return {'losses': losses, 'final_loss': losses[-1]}
 
 class PolicyGradient:
     """Policy Gradient for behavior learning"""
@@ -277,59 +302,24 @@ class SafetyConstraints:
     """Safety constraints for driver behavior"""
     
     def __init__(self):
-        self.safety_rules = []
-        
-        logger.info(f"✅ Safety Constraints initialized")
-    
+        self._rules = []
+
+    @property
+    def safety_rules(self):
+        # Mutate through add_rule; callers receive a defensive rule collection.
+        return [dict(rule) for rule in self._rules]
+
     def add_rule(self, rule: Dict):
-        """Add safety rule"""
-        self.safety_rules.append(rule)
-    
+        owned = own_rule(rule)
+        if len(self._rules) >= MAX_RULES:
+            raise AdvisoryAdmissionError('rule collection exceeds admitted capacity')
+        self._rules.append(owned)
+
     def check_safety(self, state: np.ndarray, action: np.ndarray) -> Tuple[bool, str]:
-        """Check if action is safe"""
-        for rule in self.safety_rules:
-            if rule['type'] == 'speed':
-                if self._check_speed_rule(state, action, rule):
-                    return False, f"Speed violation: {rule['description']}"
-            
-            elif rule['type'] == 'lane':
-                if self._check_lane_rule(state, action, rule):
-                    return False, f"Lane violation: {rule['description']}"
-            
-            elif rule['type'] == 'distance':
-                if self._check_distance_rule(state, action, rule):
-                    return False, f"Distance violation: {rule['description']}"
-            
-            elif rule['type'] == 'brake':
-                if self._check_brake_rule(state, action, rule):
-                    return False, f"Brake violation: {rule['description']}"
-        
-        return True, "Safe"
-    
-    def _check_speed_rule(self, state: np.ndarray, action: np.ndarray, rule: Dict) -> bool:
-        """Check speed limit rule"""
-        speed = state[0] if len(state) > 0 else 0
-        max_speed = rule.get('max_speed', 80)
-        return speed > max_speed
-    
-    def _check_lane_rule(self, state: np.ndarray, action: np.ndarray, rule: Dict) -> bool:
-        """Check lane keeping rule"""
-        lane_deviation = state[1] if len(state) > 1 else 0
-        max_deviation = rule.get('max_deviation', 0.5)
-        return abs(lane_deviation) > max_deviation
-    
-    def _check_distance_rule(self, state: np.ndarray, action: np.ndarray, rule: Dict) -> bool:
-        """Check following distance rule"""
-        distance = state[2] if len(state) > 2 else 100
-        min_distance = rule.get('min_distance', 50)
-        return distance < min_distance
-    
-    def _check_brake_rule(self, state: np.ndarray, action: np.ndarray, rule: Dict) -> bool:
-        """Check braking rule"""
-        brake = action[2] if len(action) > 2 else 0
-        max_brake = rule.get('max_brake', 0.8)
-        return brake > max_brake
-    
+        """Evaluate configured toy predicates; unknown observations never satisfy them."""
+        result = evaluate_rules(self._rules, state, action)
+        return result['safe'] is True, result['message']
+
     def get_default_rules(self) -> List[Dict]:
         """Get default safety rules"""
         return [
@@ -356,6 +346,8 @@ class ImitationLearningModel:
         self.inverse_rl = InverseRL(state_dim, action_dim, hidden_dim)
         self.policy_gradient = PolicyGradient(state_dim, action_dim, hidden_dim)
         self.safety = SafetyConstraints()
+        for rule in self.safety.get_default_rules():
+            self.safety.add_rule(rule)
         
         self.bc_optimizer = torch.optim.Adam(self.behavioral_cloning.parameters(), lr=1e-3)
         
@@ -369,44 +361,41 @@ class ImitationLearningModel:
         batch_size: int = 32
     ) -> Dict:
         """Train behavioral cloning"""
+        for name, value in (('epochs', epochs), ('batch_size', batch_size)):
+            if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        parameter = next(self.behavioral_cloning.parameters())
+        # Own and admit the entire dataset before shuffle, mode or Adam changes.
+        states = torch.as_tensor(expert_states, dtype=parameter.dtype, device=parameter.device).detach().clone()
+        actions = torch.as_tensor(expert_actions, dtype=parameter.dtype, device=parameter.device).detach().clone()
+        if states.ndim != 2 or not len(states) or states.shape[1] != self.state_dim:
+            raise ValueError("states must be nonempty rows with state_dim features")
+        if actions.shape != (len(states), self.action_dim):
+            raise ValueError("actions must have one action_dim vector per state row")
+        if not torch.isfinite(states).all() or not torch.isfinite(actions).all():
+            raise ValueError("expert demonstrations must be finite")
+
         losses = []
-        
+        self.behavioral_cloning.train()
         for epoch in range(epochs):
-            # Shuffle data
-            indices = np.random.permutation(len(expert_states))
-            states_shuffled = expert_states[indices]
-            actions_shuffled = expert_actions[indices]
-            
-            total_loss = 0
-            num_batches = 0
-            
-            for i in range(0, len(expert_states), batch_size):
-                batch_states = torch.tensor(states_shuffled[i:i+batch_size], dtype=torch.float32)
-                batch_actions = torch.tensor(actions_shuffled[i:i+batch_size], dtype=torch.float32)
-                
-                # Forward pass
-                pred_actions = self.behavioral_cloning(batch_states)
-                loss = F.mse_loss(pred_actions, batch_actions)
-                
-                # Backward pass
+            indices = np.random.permutation(len(states))
+            total_loss = 0.0
+            for start in range(0, len(states), batch_size):
+                rows = torch.as_tensor(indices[start:start + batch_size], device=parameter.device)
+                prediction = self.behavioral_cloning(states[rows])
+                loss = F.mse_loss(prediction, actions[rows])
+                if not torch.isfinite(loss):
+                    raise ValueError("cloning objective cannot be represented finitely")
                 self.bc_optimizer.zero_grad()
                 loss.backward()
+                # Infinite max_norm preserves finite gradients without clipping bias.
+                torch.nn.utils.clip_grad_norm_(self.behavioral_cloning.parameters(),
+                                               float('inf'), error_if_nonfinite=True)
                 self.bc_optimizer.step()
-                
-                total_loss += loss.item()
-                num_batches += 1
-            
-            avg_loss = total_loss / num_batches
-            losses.append(avg_loss)
-            
-            if (epoch + 1) % 20 == 0:
-                logger.info(f"BC Epoch {epoch+1}/{epochs}: Loss={avg_loss:.4f}")
-        
-        return {
-            'losses': losses,
-            'final_loss': losses[-1]
-        }
-    
+                total_loss += loss.item() * len(rows)
+            losses.append(total_loss / len(states))
+        return {'losses': losses, 'final_loss': losses[-1]}
+
     def train_irl(
         self,
         expert_states: np.ndarray,
@@ -431,33 +420,9 @@ class ImitationLearningModel:
         return self.policy_gradient.train(trajectories, epochs)
     
     def predict_action(self, state: np.ndarray, safety_check: bool = True) -> Dict:
-        """Predict action with safety check"""
-        # Behavioral cloning prediction
-        bc_action = self.behavioral_cloning.predict_action(state)
-        
-        # Policy gradient prediction
-        pg_action = self.policy_gradient.get_action(state, explore=False)
-        
-        # Combine predictions
-        action = (bc_action + pg_action) / 2
-        action = np.clip(action, -1, 1)
-        
-        # Safety check
-        if safety_check:
-            is_safe, message = self.safety.check_safety(state, action)
-            if not is_safe:
-                logger.warning(f"Unsafe action detected: {message}")
-                # Adjust action to be safe
-                action = self._adjust_action(state, action)
-        
-        return {
-            'action': action.tolist(),
-            'bc_action': bc_action.tolist(),
-            'pg_action': pg_action.tolist(),
-            'safe': safety_check,
-            'message': 'Safe' if safety_check else 'Unsafe'
-        }
-    
+        """Continuous advisory plus separate categorical identity and honest toy predicates."""
+        return recommend(self, state, safety_check)
+
     def _adjust_action(self, state: np.ndarray, action: np.ndarray) -> np.ndarray:
         """Adjust action to satisfy safety constraints"""
         adjusted = action.copy()
@@ -479,6 +444,7 @@ class ImitationLearningModel:
         
         return adjusted
     
+    @reward_owned
     def save(self, path: str = "models/imitation_model.pth"):
         """Save model"""
         torch.save({
@@ -489,6 +455,7 @@ class ImitationLearningModel:
         }, path)
         logger.info(f"✅ Model saved to {path}")
     
+    @reward_owned
     def load(self, path: str = "models/imitation_model.pth"):
         """Load model"""
         checkpoint = torch.load(path, map_location='cpu')

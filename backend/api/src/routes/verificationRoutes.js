@@ -12,8 +12,34 @@ import { scanDocument, MalwareScanError } from '../lib/malwareScanner.js';
 import { PolicyError, policy } from '../security/policyEngine.js';
 import digilockerService from '../services/digilockerService.js';
 import { validateDocumentBuffer, DocumentValidationError } from '../lib/documentValidation.js';
+// backend/api/src/routes/verificationRoutes.js
 import zkpService from '../services/zkp/zkp.service.js';
 
+router.get('/order/:orderId', authenticate, userLimiter, async (req, res) => {
+  const { orderId } = req.params;
+
+  try {
+    // Use per-request authenticated client instead of global anon client
+    const userClient = createUserClient(req.token);
+
+    const { data: order, error } = await userClient
+      .from('orders')
+      .select('id, order_display_id, status, driver_id, customer_id')
+      .eq('id', orderId)
+      .maybeSingle();
+
+    if (error || !order) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
+    // Proceed with verification context retrieval using userClient...
+    const context = await getVerificationContext(orderId, userClient);
+    return res.json({ success: true, order, context });
+  } catch (err) {
+    logger.error({ error: err.message }, 'Failed to fetch verification order context');
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
 const router = express.Router();
 const orderVerificationLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -163,15 +189,27 @@ router.post('/digilocker/token', digilockerLimiter, authenticate, async (req, re
 
 router.post('/digilocker/verify', digilockerLimiter, authenticate, async (req, res) => {
   try {
-    const { accessToken } = req.body;
-    const userId = req.user?.id;
-    if (!userId) {
+    const { accessToken, userId: bodyUserId } = req.body;
+    const authenticatedUserId = req.user?.id;
+
+    if (!authenticatedUserId) {
       return res.status(401).json({ success: false, error: 'Authentication required' });
     }
+
+    // Fixed #10259: Prevent IDOR / privilege escalation by rejecting bodyUserId mismatches 
+    // instead of falling back to client-supplied user identifiers.
+    if (bodyUserId && bodyUserId !== authenticatedUserId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden: Cannot verify documents for another user identity.',
+      });
+    }
+
     if (!accessToken) {
       return res.status(400).json({ success: false, error: 'Access token is required' });
     }
-    const verificationResult = await digilockerService.verifyDocuments(userId, accessToken);
+
+    const verificationResult = await digilockerService.verifyDocuments(authenticatedUserId, accessToken);
     res.status(200).json({
       success: true,
       data: verificationResult
@@ -191,7 +229,8 @@ const OCR_HTTP_TIMEOUT_MS = 15000;
 function normalizeKycDocNumber(value) {
   if (typeof value !== 'string') return null;
   const cleaned = value.replace(/\s+/g, '').toUpperCase();
-  if (!/^[A-Z0-9]{4,30}$/.test(cleaned)) return null;
+  // Hyphens are common in document numbers (DL-12345678) — allow them.
+  if (!/^[A-Z0-9-]{4,30}$/.test(cleaned)) return null;
   return cleaned;
 }
 
@@ -207,6 +246,7 @@ const upload = multer({
   },
 });
 
+// Fixed #10258: `authenticate` runs BEFORE `upload.single('image')` to prevent unauthenticated memory-exhaustion DoS
 router.post('/kyc/upload', kycUploadLimiter, authenticate, upload.single('image'), async (req, res) => {
   try {
     const userId = req.user.id;

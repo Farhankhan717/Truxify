@@ -97,10 +97,6 @@ router.post('/verify-crosschain', oracleVerificationLimiter, authenticate, valid
   try {
     const { orderId, blockchainHash } = req.body;
 
-    // Defense in depth: reject malformed transaction hashes before any order
-    // lookup or oracle/RPC work. The request schema enforces the same bytes32
-    // shape, but this guard keeps the route safe if validation is bypassed or
-    // a future schema regression weakens the constraint.
     if (!BLOCKCHAIN_TX_HASH_RE.test(blockchainHash)) {
       return res.status(400).json({
         success: false,

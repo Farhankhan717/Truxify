@@ -1,4 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+/**
+ * Unit Tests for WorkZone Service
+ * 
+ * Tests delay prediction logic, fail-open error handling, 
+ * and bypass waypoint generation.
+ */
+
+
 import workZoneService, {
   WorkZoneService,
   predictWorkZoneDelays,
@@ -857,9 +865,10 @@ describe('WorkZoneService Unit Tests', () => {
         expect(result.problematicPoint).not.toBeNull();
 
         expect(logger.info).toHaveBeenCalledWith(
-          expect.stringContaining(
-            '[WorkZoneService] Predicted severe commercial delay'
-          )
+          expect.objectContaining({
+            event: 'WORKZONE_SEVERE_DELAY_PREDICTED',
+          }),
+          expect.any(String)
         );
       }
     });
@@ -892,9 +901,10 @@ describe('WorkZoneService Unit Tests', () => {
       });
 
       expect(logger.error).toHaveBeenCalledWith(
-        expect.stringContaining(
-          '[WorkZoneService] Error predicting work-zone delays'
-        )
+        expect.objectContaining({
+          event: 'WORKZONE_PREDICTION_ERROR',
+        }),
+        expect.any(String)
       );
     });
   });

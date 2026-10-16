@@ -2,8 +2,27 @@ import { redisClient } from '../config/db.js';
 import logger from '../middleware/logger.js';
 import CircuitBreaker from 'opossum';
 import { measureExecution } from '../core/performanceMetrics.js';
+import logger from '../middleware/logger.js';
 import { validateCoordinate } from '../utils/coordinates.js';
 
+// Inside OSRM service methods (e.g., getRouteEstimate, getRouteGeometry)
+async function getRouteEstimate(origin, destination, requestId = null) {
+  try {
+    // ... OSRM API fetch or axios call ...
+  } catch (err) {
+    logger.error({
+      event: 'OSRM_ERROR',
+      error: err.message,
+      stack: err.stack,
+      requestId: requestId,
+      origin,
+      destination,
+    }, 'Failed to fetch route estimate from OSRM service');
+
+    // Return fallback geometry or rethrow depending on service pattern
+    throw err;
+  }
+}
 const osrmBreaker = new CircuitBreaker(async (url, options) => {
   const response = await fetch(url, options);
   if (response.status >= 500) {
@@ -350,20 +369,20 @@ function haversineFallbackKm(lat1, lon1, lat2, lon2) {
 }
 
 export async function routeWithFailover(primary, _fb, coords) {
-  try { 
-    return await primary(coords); 
+  try {
+    return await primary(coords);
   } catch (err) {
     // 🛠️ FIX FOR ISSUE #10653: Properly log error details from catch block
     logger.warn({ errMessage: err?.message, stack: err?.stack }, '[osrm] routeWithFailover: primary call failed, falling back to haversine');
-    
+
     if (!coords || !coords[0] || !coords[0][0] || !coords[0][1]) {
       return { distance: 0, source: 'haversine-fallback', error: 'No valid coordinates for haversine fallback' };
     }
     const [a, b] = coords[0];
-    return { 
-      distance: haversineFallbackKm(a[1], a[0], b[1], b[0]), 
-      source: 'haversine-fallback', 
-      error: err?.message 
+    return {
+      distance: haversineFallbackKm(a[1], a[0], b[1], b[0]),
+      source: 'haversine-fallback',
+      error: err?.message
     };
   }
 }

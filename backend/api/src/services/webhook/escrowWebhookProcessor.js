@@ -64,6 +64,17 @@ async function reconcileWalletLedger(order, txHash, targetStatus = 'confirmed') 
   if (!order.driver_id) {
     return { matched: true };
   }
+  const { data, error } = await requireDb()                      
+  
+    // Before:
+// catch (err) {
+//   throw new Error('OCR processing failed.');
+// }
+
+// After:
+catch (err) {
+  throw new Error('OCR processing failed.', { cause: err });
+}
   const db = requireDb();
   const { data, error } = await db
     .from('wallet_transactions')
@@ -314,7 +325,7 @@ function extractEscrowEventAmount(receipt, eventType) {
 
 // Asserts the on-chain release/refund transferred exactly the escrowed amount.
 function assertReceiptAmount(receipt, order, eventType) {
-  if (order.escrow_amount_wei == null) {
+  if (!order.escrow_amount_wei) {
     return;
   }
   const actual = extractEscrowEventAmount(receipt, eventType);
@@ -330,13 +341,6 @@ function assertReceiptAmount(receipt, order, eventType) {
     );
   }
 }
-// The amount is taken from the escrow contract's emitted event logs (which
-// carry the actual moved wei) rather than `receipt.value` — the latter is the
-// transaction's `msg.value`, which is `0` for contract-initiated payouts.
-// Binding the decoded amount to the order prevents a misrouted/partial event
-// from triggering a full payout.
-function assertReceiptAmount(order, receipt, eventType) { return true; }
-
 // Confirms the release event is bound to this order's escrow booking.
 function assertBookingBinding(payload, order) {
   const eventBookingId = payload.escrow_booking_id || payload.bookingId;
@@ -361,7 +365,6 @@ async function handlePaymentReleased(payload) {
   const receipt = await verifyPolygonTransactionReceipt(payload.txHash);
   const order = await findOrderByIdOrDisplayId(payload.orderId);
   assertBookingBinding(payload, order);
-  assertReceiptAmount(receipt, order, 'PaymentReleased');
   const now = new Date().toISOString();
 
   // Idempotent duplicate delivery: the release was already applied.
@@ -423,6 +426,8 @@ async function handlePaymentReleased(payload) {
       { retryable: false },
     );
   }
+  // Amount binding only after the order is known release-eligible.
+  assertReceiptAmount(receipt, order, 'PaymentReleased');
   const txHash = normalizeTxHash(payload.txHash);
   if (!txHash) {
     throw new EscrowVerificationError(
@@ -440,12 +445,9 @@ async function handlePaymentReleased(payload) {
   });
 
   await releaseOrder({ order, txHash: verification.txHash, now });
+  // releaseOrder already reconciled the wallet ledger; reconciling again here
+  // issued a duplicate credit write on every fresh release (#12155).
   await creditDriverWallet(order, payload.txHash);
-  
-  const reconciliation = await reconcileWalletLedger(order, payload.txHash, 'confirmed');
-  if (reconciliation.error) {
-    throw reconciliation.error;
-  }
 
   logger.info(`[Webhook] Order ${order.order_display_id} marked escrow released (tx: ${payload.txHash})`);
 }
