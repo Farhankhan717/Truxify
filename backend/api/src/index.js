@@ -249,7 +249,13 @@ if (!process.env.WEBHOOK_SECRET) {
   logger.fatal('WEBHOOK_SECRET is not set. Escrow webhook signature verification cannot run and webhook requests will be rejected. Set WEBHOOK_SECRET and restart.')
   process.exit(1)
 }
+// backend/api/src/index.js (Excerpt around startup checks)
 
+// FIX: Immediately abort startup if BYPASS_AUTH is enabled in production per issue #6724
+if (process.env.BYPASS_AUTH === 'true' && process.env.NODE_ENV === 'production') {
+  console.error('FATAL: BYPASS_AUTH cannot be enabled in production. Exiting immediately.');
+  process.exit(1);
+}
 // ============================================================================
 // 🆕 WEBHOOK VALIDATION
 // ============================================================================
