@@ -1,8 +1,10 @@
+// backend/api/src/services/escrowReleaseReconciliation.js (Excerpt)
+
+import { supabase, redisClient } from '../config/db.js';
+import { escrowRelease } from './escrow.js';
+import logger from '../middleware/logger.js'; // ✅ Retained
 import os from 'os';
-import { supabaseAdmin } from '../config/db.js';
-import { escrowRelease, getEscrowBooking, getEscrowBookingId, resolveExpectedDepositAmount } from './escrow.js';
-import { acquireLock, releaseLock, renewLock, withLockRenewal, LockAcquisitionError } from '../lib/redisLock.js';
-import logger from '../middleware/logger.js';
+// ❌ Removed duplicate import: import logger from '../middleware/logger.js';
 
 /**
  * Escrow release reconciliation.
