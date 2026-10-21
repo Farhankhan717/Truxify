@@ -5,6 +5,10 @@ import { escrowRelease } from './escrow.js';
 import logger from '../middleware/logger.js'; // ✅ Retained
 import os from 'os';
 // ❌ Removed duplicate import: import logger from '../middleware/logger.js';
+import { supabaseAdmin } from '../config/db.js';
+import { escrowRelease, getOnChainEscrowBooking, getEscrowBookingId, resolveExpectedDepositAmount } from './escrow.js';
+import { acquireLock, releaseLock, renewLock, withLockRenewal, LockAcquisitionError } from '../lib/redisLock.js';
+import logger from '../middleware/logger.js';
 
 /**
  * Escrow release reconciliation.
@@ -142,7 +146,7 @@ async function finalizeReleasedOrder(order, orderRepository) {
   }
 
   // The on-chain booking is the source of truth for whether the release happened.
-  const booking = await getEscrowBooking(getEscrowBookingId(fresh.order_display_id));
+  const booking = await getOnChainEscrowBooking(getEscrowBookingId(fresh.order_display_id));
   const chainReleased = Boolean(booking && booking.paid === true);
 
   if (!chainReleased) {
