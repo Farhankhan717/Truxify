@@ -119,11 +119,19 @@ export function checkOcrConfidence(docType, confidence) {
  * @returns {{expired: boolean, daysUntilExpiry: number, warning: boolean}}
  */
 export function checkExpiry(expiryDate, warningDays = 30) {
+    // A missing or unparseable expiry date must never be treated as valid.
+    // `new Date('not-a-date')` produces an invalid Date whose NaN timestamp
+    // makes every comparison false, which previously returned expired:false
+    // and let an unreadable document pass verification.
     if (!expiryDate) {
-        return { expired: false, daysUntilExpiry: null, warning: false };
+        return { expired: true, daysUntilExpiry: null, warning: false, reason: 'missing_expiry' };
     }
 
     const expiry = new Date(expiryDate);
+    if (Number.isNaN(expiry.getTime())) {
+        return { expired: true, daysUntilExpiry: null, warning: false, reason: 'invalid_expiry' };
+    }
+
     const now = new Date();
     const diffMs = expiry.getTime() - now.getTime();
     const daysUntilExpiry = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
