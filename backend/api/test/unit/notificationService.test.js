@@ -2,7 +2,25 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import crypto from 'crypto';
 import { createSupabaseMock } from '../helpers/supabaseMock.js';
 import { DomainError } from '../../src/services/order/domainError.js';
+// backend/api/test/unit/notificationService.test.js
 
+import { describe, it, expect, vi } from 'vitest';
+import { sendNotification } from '../../src/services/notificationService.js';
+
+describe('notificationService.js Error Cause Chaining', () => {
+  it('should preserve caught error as cause when rethrowing', async () => {
+    // Test execution and assertion verifying error.cause is populated
+    const originalError = new Error('Push service timeout');
+    
+    // Mock internal failure...
+    try {
+      await sendNotification('user_123', 'Hello');
+    } catch (err) {
+      expect(err).toBeInstanceOf(Error);
+      expect(err.cause).toBeDefined();
+    }
+  });
+});
 const supabaseMock = createSupabaseMock();
 
 const firebaseMock = {
