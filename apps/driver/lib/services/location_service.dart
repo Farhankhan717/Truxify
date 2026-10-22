@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -30,6 +32,9 @@ void _connectWebSocket() async {
   // Establish WebSocket connection...
   // _channel = WebSocketChannel.connect(wsUri);
 }
+/// WebSocket connection lifecycle for the driver location channel.
+enum WsConnectionStatus { connecting, connected, disconnected }
+
 /// Outcome of a location ping attempt.
 ///
 /// A ping is `delivered` only when the WebSocket transport accepted it, and
@@ -212,6 +217,23 @@ class LocationService {
         return false;
       }
     };
+    _replayService.sendSyncLocations = 
+        ({required locations, required token}) async {
+      try {
+        final url = Uri.parse('$defaultApiBaseUrl/api/devices/locations/sync');
+        final response = await http.post(
+          url,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $token',
+          },
+          body: jsonEncode({'locations': locations}),
+        );
+        return response.statusCode >= 200 && response.statusCode < 300;
+      } catch (_) {
+        return false;
+      }
+    };
     _replayService.tokenProvider =
         () => Supabase.instance.client.auth.currentSession?.accessToken;
     _replayService.driverIdProvider =
@@ -266,12 +288,31 @@ class LocationService {
     });
   }
 
+  /// Fallback heartbeat: re-send the last known position when nothing went
+  /// out within [_maxInterval]. Serialized with position-stream sends and
+  /// re-checks the throttle so it never duplicates a recent ping (#13955).
+  Future<void> _sendFallbackPing() async {
+    await _serializeSend(() async {
+      if (!_isTracking) return;
+      final last = _lastSentPosition;
+      if (last == null) return;
+      final lastTime = _lastSentTime;
+      if (lastTime != null && DateTime.now().difference(lastTime) < _maxInterval) return;
+      final result = await _sendLocationPing(last);
+      if (result == LocationDelivery.delivered ||
+          result == LocationDelivery.queued) {
+        _lastSentTime = DateTime.now();
+      }
+    });
+  }
+
+
   Future<void> _handleLocationUpdate(Position position) async {
     // Drop stale/cached fixes: Geolocator routinely re-emits the last-known
     // position with an old `timestamp` (after startup, GPS loss, or waking from
     // background). Forwarding it would show the truck where it no longer is.
     if (position.timestamp != null &&
-        DateTime.now().difference(position.timestamp!) > _maxLocationAge) {
+        DateTime.now().difference(position.timestamp) > _maxLocationAge) {
       debugPrint('[LocationService] Stale GPS fix dropped');
       return;
     }
@@ -282,18 +323,6 @@ class LocationService {
       return;
     }
 
-    // Implement displacement-based throttling
-    if (_lastSentPosition == null) {
-      // First position, always send
-      final result = await _sendLocationPing(position);
-      if (result == LocationDelivery.delivered ||
-          result == LocationDelivery.queued) {
-        _lastSentTime = DateTime.now();
-      }
-    });
-  }
-
-  Future<void> _handleLocationUpdate(Position position) async {
     // Serialize the throttle decision + send + state update so two concurrent
     // updates (or the fallback timer) cannot both read the same stale throttle
     // state and both pass the check (issue #13955).
@@ -639,7 +668,7 @@ class LocationService {
         _wsAuthenticated = false;
         final token = await _resolveAuthToken();
         if (token != null && token.isNotEmpty) {
-          ws.send({'event': 'auth', 'data': {'token': token}});
+          _resilientWs?.send({'event': 'auth', 'data': {'token': token}});
         }
       },
       urlFactory: () => _buildWsUri().toString(),
@@ -674,7 +703,9 @@ class LocationService {
               }
             }
           }
-        } catch (_) {}
+        } catch (e) {
+          debugPrint('[LocationService] Failed to process WebSocket message: $e');
+        }
       },
       onError: (error) {
         debugPrint('[LocationService] WebSocket error: $error');
@@ -713,4 +744,5 @@ class LocationService {
     _timer?.cancel();
     _socket?.disconnect();
   }
+}
 }
