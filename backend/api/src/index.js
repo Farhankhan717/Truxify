@@ -13,7 +13,16 @@ const __dirname = path.dirname(__filename)
 dotenv.config({ path: path.resolve(__dirname, '../.env') })
 dotenv.config({ path: path.resolve(__dirname, '../../../.env') })
 import hppProtection from './middleware/hppProtection.js';
+// backend/api/src/index.js (Excerpt)
 
+import express from 'express';
+import { requestIdMiddleware } from './middleware/requestId.js'; // ✅ Retained primary import
+import logger from './middleware/logger.js';
+// ... other top-level imports ...
+
+const app = express();
+
+// ... mid-file blocks (duplicate import on line 105 removed) ...
 import { globalLimiter, authLimiter, healthLimiter } from './middleware/rateLimiter.js'
 import tripRoutes from './routes/tripRoutes.js'
 import deviceRoutes from './routes/deviceRoutes.js'
