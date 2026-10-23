@@ -17,7 +17,15 @@ const connectRedis = async () => {
         await redisClient.connect();
     }
 };
+// backend/api/src/services/locationService.js (Excerpt)
 
+export function calculateRemainingEta(estimatedArrivalTime, currentTime = Date.now()) {
+  const remainingMilliseconds = new Date(estimatedArrivalTime).getTime() - currentTime;
+  const remainingMinutes = Math.ceil(remainingMilliseconds / (1000 * 60));
+
+  // ✅ Clamp ETA to a minimum of 0 to prevent negative values
+  return Math.max(0, remainingMinutes);
+}
 const ensureIndexes = async () => {
     try {
         await supabase.rpc('create_postgis_index_if_not_exists');
