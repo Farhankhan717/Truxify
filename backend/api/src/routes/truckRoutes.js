@@ -78,6 +78,9 @@
  *         number_plate:
  *           type: string
  */
+cd backend/api
+npx eslint src/routes/truckRoutes.js
+npx vitest run test/integration/trucks.test.js
 
 import express from 'express';
 import { supabase, supabaseAdmin, mongoDb, redisClient } from '../config/db.js';
