@@ -136,6 +136,8 @@ const TICKET_COLUMNS = 'id, subject, description, category, status, assigned_to,
 const TICKET_DETAIL_COLUMNS = 'id, user_id, subject, description, category, status, assigned_to, created_at, updated_at';
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const VALID_TICKET_STATUSES = ['open', 'in_progress', 'resolved', 'closed'];
+const MAX_ASSIGNMENT_AGENTS = 100;
+const MAX_ASSIGNMENT_TICKET_ROWS = 5000;
 
 const CATEGORY_MAP = {
   billing: 'payment',
@@ -181,7 +183,8 @@ async function getNextAvailableAgent() {
       .from('users')
       .select('id')
       .in('role', ['admin', 'support_agent'])
-      .eq('is_active', true);
+      .eq('is_active', true)
+      .limit(MAX_ASSIGNMENT_AGENTS);
 
     if (agentError || !agents || agents.length === 0) {
       return null;
@@ -192,10 +195,17 @@ async function getNextAvailableAgent() {
       .from('support_tickets')
       .select('assigned_to')
       .in('assigned_to', agentIds)
-      .in('status', ['open', 'in_progress']);
+      .in('status', ['open', 'in_progress'])
+      .limit(MAX_ASSIGNMENT_TICKET_ROWS);
 
     if (countError) {
       return agents[0].id;
+    }
+
+    if (ticketCounts && ticketCounts.length >= MAX_ASSIGNMENT_TICKET_ROWS) {
+      logger.warn(
+        `[SupportRoutes] Active ticket snapshot reached the ${MAX_ASSIGNMENT_TICKET_ROWS} row cap; assignment load counts may be approximate.`,
+      );
     }
 
     const loadMap = {};
