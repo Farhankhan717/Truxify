@@ -2,6 +2,7 @@ const { createClient } = require('redis');
 const { createClient: createSupabaseClient } = require('@supabase/supabase-js');
 // backend/api/src/services/locationService.js (Excerpt)
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
+import logger from '../middleware/logger.js';
 
 import { logger } from '../utils/logger.js';
 
